@@ -230,6 +230,8 @@ type ModelCodec record {|
     # How structured generation forces the single result tool on this dialect (§8).
     # Lives on the codec because tool-choice tracks the wire shape, not the route family.
     ToolChoiceStyle toolChoice;
-    # Populated, unused today — streaming is out of scope (§9.6).
+    # Whether this dialect has a streaming decoder. Read by `runChatStream`, which
+    # refuses `chatStream` before any I/O when it is false. Must stay in step with
+    # `selectStreamDialect` — `testEveryCodecClaimingStreamingHasADialect` pins that.
     boolean supportsStreaming;
 |};

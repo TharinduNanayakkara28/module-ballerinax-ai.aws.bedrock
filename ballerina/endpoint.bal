@@ -28,6 +28,14 @@ type Endpoint record {|
     string host;
     # Wire request path with the model-id segment single-encoded (§9.1).
     string path;
+    # The STREAMING counterpart of `path`, or `()` where the route has none.
+    #
+    # A separate member rather than surgery on `path` at call time: the model-id
+    # segment is single-encoded exactly once, here, and deriving the stream path by
+    # string-replacing a suffix on an already-encoded path would put that invariant
+    # in two places. Mantle has no entry — its streaming surface is SSE on the same
+    # path with `"stream": true` in the body, which is not yet implemented.
+    string? streamPath = ();
     # SigV4 signing name for this route.
     string signingService;
 |};
@@ -47,6 +55,10 @@ isolated function buildEndpoint(Route route) returns Endpoint|error {
         return {
             host: string `bedrock-mantle.${route.region}.api.aws`,
             path: entry.path,
+            // Mantle streams as SSE on the SAME path, switched on by a `"stream":
+            // true` body field rather than a different endpoint — so there is no
+            // second path to record. Left unset until that dialect is implemented.
+            streamPath: (),
             signingService: SIGNING_BEDROCK_MANTLE
         };
     }
@@ -58,7 +70,13 @@ isolated function buildEndpoint(Route route) returns Endpoint|error {
     string path = route.family == CONVERSE
         ? string `/model/${encodedId}/converse` // §9.1
         : string `/model/${encodedId}/invoke`;   // §9.1
-    return {host, path, signingService: SIGNING_BEDROCK};
+    // Bedrock puts streaming on a sibling operation, not a query flag: `Converse`
+    // pairs with `ConverseStream`, `InvokeModel` with `InvokeModelWithResponseStream`.
+    // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html
+    string streamPath = route.family == CONVERSE
+        ? string `/model/${encodedId}/converse-stream`
+        : string `/model/${encodedId}/invoke-with-response-stream`;
+    return {host, path, streamPath, signingService: SIGNING_BEDROCK};
 }
 
 // RFC 3986 unreserved set — the ONLY characters SigV4 leaves literal.

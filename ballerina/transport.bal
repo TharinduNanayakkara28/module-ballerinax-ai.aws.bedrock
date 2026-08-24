@@ -35,6 +35,9 @@ isolated client class BedrockTransport {
     private final string signingService;
     private final string host;
     private final string wirePath; // model-id segment single-encoded (from buildEndpoint)
+    // The streaming sibling of `wirePath` (`converse-stream` /
+    // `invoke-with-response-stream`), or `()` on a route that has none.
+    private final string? streamPath;
     private final http:Client httpClient;
     private final readonly & RetryConfig retryConfig;
     // Whether the RESOLVED ROUTE is Mantle. Derived from the route's own signing
@@ -53,6 +56,7 @@ isolated client class BedrockTransport {
         self.isMantleRoute = ep.signingService == SIGNING_BEDROCK_MANTLE;
         self.host = ep.host;
         self.wirePath = ep.path;
+        self.streamPath = ep.streamPath;
         self.httpClient = check new (string `https://${ep.host}`, httpConfig ?: {});
         RetryConfig rc = retryConfig ?: {};
         self.retryConfig = rc.cloneReadOnly();
@@ -110,6 +114,86 @@ isolated client class BedrockTransport {
         return self.mapResponse(resp);
     }
 
+    // POSTs a signed request to the STREAMING sibling path and hands back the live
+    // response with its body unread, for the caller to frame incrementally.
+    //
+    // SIGNING IS UNCHANGED from the buffered path, and deliberately so: Bedrock
+    // streams the RESPONSE, not the request. The request is an ordinary signed POST
+    // carrying a complete JSON body, so the payload hash is over the whole body and
+    // none of SigV4's chunked-upload machinery (an S3 concern) applies.
+    //
+    // RETRY COVERS ONLY THE HANDSHAKE — the connection and the response status. Once
+    // a 2xx is in hand the response is returned live, and a failure after that
+    // cannot be retried: chunks have already been delivered to the caller, and
+    // re-sending would duplicate the answer rather than resume it.
+    isolated function executeStreaming(json body, map<string> extraHeaders = {})
+            returns [http:Response, map<string>]|ai:Error {
+        string? path = self.streamPath;
+        if path is () {
+            // Mantle today. Reached only if a codec claims `supportsStreaming`
+            // without a stream path being built for its route — a wiring bug.
+            return error ai:Error("This Bedrock route has no streaming endpoint");
+        }
+        RetryConfig rc = self.retryConfig;
+        int attempt = 0;
+        decimal delay = rc.initialDelay;
+        while true {
+            [http:Response, map<string>]|RetryableError|ai:Error result =
+                self.executeStreamingOnce(path, body, extraHeaders);
+            if result is [http:Response, map<string>] {
+                return result;
+            }
+            if result is ai:Error {
+                return result;
+            }
+            if result is RetryableError {
+                if attempt >= rc.maxRetries {
+                    return error ai:LlmConnectionError(
+                        string `${result.message()} (retries exhausted after ${rc.maxRetries} attempts)`, result.cause());
+                }
+                runtime:sleep(delay);
+                delay = decimal:min(delay * rc.backoffFactor, rc.maxDelay);
+                attempt += 1;
+            }
+        }
+    }
+
+    // One signed streaming round-trip. Returns the response with its body UNREAD —
+    // calling `getJsonPayload`/`getTextPayload` here would buffer the whole stream
+    // and defeat the point. Only the error paths read the body, and only after the
+    // status has already ruled out a stream.
+    isolated function executeStreamingOnce(string path, json body, map<string> extraHeaders)
+            returns [http:Response, map<string>]|RetryableError|ai:Error {
+        string payload = body.toJsonString();
+        map<string>|error headers = self.signedHeadersFor(path, payload, extraHeaders);
+        if headers is error {
+            return error ai:Error("Failed to sign the Bedrock streaming request", headers);
+        }
+        http:Request req = new;
+        req.setTextPayload(payload, contentType = APPLICATION_JSON);
+        foreach [string, string] [k, v] in headers.entries() {
+            req.setHeader(k, v);
+        }
+        http:Response|error resp = self.httpClient->post(path, req);
+        if resp is error {
+            return error RetryableError("Connection error while opening the Bedrock stream", resp);
+        }
+        http:Response response = resp;
+        int status = response.statusCode;
+        if status < 200 || status >= 300 {
+            return self.mapErrorStatus(response);
+        }
+        // The request id is the only response header the stream needs: the event
+        // payloads carry no completion id of their own, and the `ai` contract wants
+        // one that is stable across every chunk of a response.
+        map<string> responseHeaders = {};
+        string? requestId = optionalHeader(response, "x-amzn-RequestId");
+        if requestId is string {
+            responseHeaders[REQUEST_ID_HEADER] = requestId;
+        }
+        return [response, responseHeaders];
+    }
+
     // Maps an HTTP response to a `TransportResponse` or a typed error (§9.5 table).
     isolated function mapResponse(http:Response resp) returns TransportResponse|RetryableError|ai:Error {
         int status = resp.statusCode;
@@ -133,6 +217,15 @@ isolated client class BedrockTransport {
             }
             return {body: jsonBody, headers: responseHeaders};
         }
+        return self.mapErrorStatus(resp);
+    }
+
+    // Non-2xx -> a typed error. EXTRACTED from `mapResponse` so the streaming path
+    // shares the exact same status table: a 403 on `converse-stream` must carry the
+    // same IAM hint as a 403 on `converse`, and duplicating the table would let the
+    // two drift.
+    isolated function mapErrorStatus(http:Response resp) returns RetryableError|ai:Error {
+        int status = resp.statusCode;
         string detail = self.errorDetail(resp);
         boolean mantle = self.isMantleRoute;
         match status {
@@ -178,11 +271,22 @@ isolated client class BedrockTransport {
         return string `status ${resp.statusCode}`;
     }
 
-    // Builds the SigV4 (or bearer) headers for one request (design §9.4-9.5).
+    // Builds the SigV4 (or bearer) headers for a request against the fixed
+    // `wirePath`. A thin wrapper over `signedHeadersFor`, kept so the golden signing
+    // tests — pinned to this exact signature — need no change.
+    //
     // `fixedClock` exists ONLY for tests: signing is otherwise unobservable without
     // live AWS, and a wall clock makes the output unassertable. Production callers
     // omit it and get `amzTimestamps()`.
     isolated function signedHeaders(string payload, map<string> extraHeaders,
+            [string, string]? fixedClock = ()) returns map<string>|error
+        => self.signedHeadersFor(self.wirePath, payload, extraHeaders, fixedClock);
+
+    // The path-parameterised form. Streaming signs a DIFFERENT path from the
+    // buffered call (`converse-stream` rather than `converse`), and the path is
+    // baked into the canonical URI, so it cannot stay fixed at `self.wirePath` —
+    // signing the wrong one yields `SignatureDoesNotMatch`, not a 404.
+    isolated function signedHeadersFor(string path, string payload, map<string> extraHeaders,
             [string, string]? fixedClock = ()) returns map<string>|error {
         map<string> headers = {};
         foreach [string, string] [k, v] in extraHeaders.entries() {
@@ -211,7 +315,7 @@ isolated client class BedrockTransport {
         [string, string] [amzDate, dateStamp] = fixedClock ?: check amzTimestamps();
         // Canonical URI is the DOUBLE-encoded wire path (SigV4 non-S3 rule §9.4):
         // the server re-encodes the received (single-encoded) path once to match.
-        string canonicalUri = getCanonicalUri(self.wirePath);
+        string canonicalUri = getCanonicalUri(path);
         string payloadHash = array:toBase16(crypto:hashSha256(payload.toBytes())).toLowerAscii();
 
         string accessKey = creds.accessKeyId;

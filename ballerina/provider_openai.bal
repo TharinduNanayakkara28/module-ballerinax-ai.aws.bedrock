@@ -64,6 +64,9 @@ public isolated distinct client class OpenAIModelProvider {
 
     private final ApiFamily family;
     private final string wireModelId;
+    // Kept alongside `wireModelId` for streaming: the stream DIALECT is chosen from
+    // the bare (geo-prefix-stripped) id, which `wireModelId` no longer carries.
+    private final string bareModelId;
     private final readonly & ModelCodec codec;
     private final BedrockTransport transport;
     private final readonly & InferenceParams params;
@@ -98,6 +101,7 @@ public isolated distinct client class OpenAIModelProvider {
 
         self.family = route.family;
         self.wireModelId = route.effectiveModelId;
+        self.bareModelId = route.bareModelId;
         self.codec = codec;
         self.transport = transport;
         self.supportsStructuredOutput = route.family != MANTLE; // amendment
@@ -122,6 +126,43 @@ public isolated distinct client class OpenAIModelProvider {
             @display {label: "Expected type"} typedesc<anydata> td = <>)
             returns td|ai:Error = @java:Method {
         'class: "io.ballerina.lib.ai.aws.bedrock.Generator"
+    } external;
+
+    # Sends a chat request and streams the reply as normalized chunks.
+    #
+    # Supported on the Converse route for every vendor (`ConverseStream` is
+    # model-agnostic) and on the Invoke route for Claude and Nova. Any other route
+    # returns an `ai:Error` naming `apiFamily = CONVERSE` as the remedy.
+    #
+    # NOT `isolated`, unlike `chat`: the returned stream is backed by an iterator
+    # carrying mutable framing state. `ai:ModelProvider` does not declare it
+    # isolated either.
+    #
+    # + messages - Chat messages or a single user message
+    # + tools - Tool definitions for function calling
+    # + stop - Stop sequence; overrides configured `stopSequences`
+    # + return - A stream of response chunks, or an `ai:Error`
+    remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools = [], string? stop = ())
+            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error
+        => runChatStream("OpenAI", self.family, self.wireModelId, self.bareModelId, self.codec,
+            self.transport, self.extraHeaders, self.params, messages, tools, stop);
+
+    # Streams a generated value as it is produced. Only a `string` target type is
+    # supported — structured output is obtained by forcing a tool call, whose
+    # arguments cannot be bound until the whole JSON has arrived.
+    #
+    # External Java per the platform convention, as `generate`: a dependently typed
+    # function must be external. The shim calls back into
+    # `generateLlmResponseStream`, which projects `chatStream`'s chunks onto text.
+    #
+    # + prompt - The prompt to use in the chat request
+    # + td - Type descriptor of the expected return type
+    # + return - A stream of text fragments, or an `ai:Error`
+    remote function generateStream(ai:Prompt prompt,
+            @display {label: "Expected type"} typedesc<anydata> td = <>)
+            returns stream<td, ai:Error?>|ai:Error = @java:Method {
+        'class: "io.ballerina.lib.ai.aws.bedrock.StreamGenerator"
     } external;
 }
 
