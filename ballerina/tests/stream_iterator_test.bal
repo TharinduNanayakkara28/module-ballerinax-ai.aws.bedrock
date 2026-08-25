@@ -132,8 +132,10 @@ function testStreamPipelineBackfillsIdAndModel() {
 
 @test:Config {}
 function testStreamPipelineIsIndifferentToReadChunking() {
-    // Production reads ONE byte at a time, but frame boundaries must not depend on
-    // where the reads fall. The same wire decoded at four read sizes must agree.
+    // Frame boundaries must not depend on where the reads fall. Production uses
+    // STREAM_READ_SIZE (16), but that constant is a latency tuning choice and has
+    // been changed once already — decoding must stay identical whatever it is set
+    // to, so the same wire is decoded at four sizes and required to agree.
     byte[] wire = converseFrame("messageStart", "{\"role\":\"assistant\"}");
     wire.push(...converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"abc\"}}"));
     wire.push(...converseFrame("messageStop", "{\"stopReason\":\"end_turn\"}"));

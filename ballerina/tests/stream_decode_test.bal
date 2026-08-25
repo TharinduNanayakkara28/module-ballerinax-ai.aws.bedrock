@@ -318,3 +318,71 @@ function testEveryCodecClaimingStreamingHasADialect() {
     test:assertFalse(INVOKE_MISTRAL_CHAT_CODEC.supportsStreaming);
     test:assertFalse(INVOKE_MISTRAL_TEXT_CODEC.supportsStreaming);
 }
+
+// ---------------------------------------------------------------------------
+// Invoke envelope: where the event NAME lives
+// ---------------------------------------------------------------------------
+
+@test:Config {}
+function testNovaInvokeNamesItsEventInThePayloadKey() {
+    // REGRESSION, found live 2026-08-24: Nova on InvokeModelWithResponseStream
+    // produced a clean, EMPTY stream — 0 chunks, no error. On Invoke the
+    // `:event-type` header is the constant `chunk`, and Nova names the event with
+    // the single top-level key of the payload instead. The decoder matched `chunk`,
+    // found no case, and skipped every frame.
+    json novaShaped = {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "hi"}}};
+    [string, json] [eventType, payload] = unwrapNamedEvent("chunk", novaShaped);
+    test:assertEquals(eventType, CONVERSE_EVT_CONTENT_BLOCK_DELTA);
+
+    ConverseStreamDecoder decoder = new;
+    ai:ChatCompletionChunk chunk = decodeOne(decoder, eventType, payload);
+    test:assertEquals(deltaOf(chunk).content, "hi");
+}
+
+@test:Config {}
+function testNovaInvokeMetadataFrameCarriesInvocationMetricsAlongside() {
+    // REGRESSION, found live 2026-08-25: every Nova Invoke frame is single-key
+    // EXCEPT the terminal one, which Bedrock decorates with its own
+    // `amazon-bedrock-invocationMetrics`. An arity guard on the unwrap dropped it,
+    // so the stream reported no usage at all — the metadata event is the only place
+    // a Converse-shaped stream ever sends it.
+    json novaMetadata = {
+        "metadata": {"usage": {"inputTokens": 7, "outputTokens": 6}, "metrics": {}, "trace": {}},
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 7, "outputTokenCount": 6}
+    };
+    [string, json] [eventType, payload] = unwrapNamedEvent("chunk", novaMetadata);
+    test:assertEquals(eventType, CONVERSE_EVT_METADATA);
+
+    ConverseStreamDecoder decoder = new;
+    ai:ChatCompletionChunk chunk = decodeOne(decoder, eventType, payload);
+    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunk?.usage;
+    test:assertEquals(usage?.promptTokens, 7);
+    test:assertEquals(usage?.completionTokens, 6);
+    // Nova omits `totalTokens` on Invoke, unlike ConverseStream, which sends all three.
+    test:assertEquals(usage?.totalTokens, ());
+}
+
+@test:Config {}
+function testHeaderNamedEventsAreLeftAlone() {
+    // ConverseStream on bedrock-runtime names the event in the HEADER, and its
+    // payload is not single-key-wrapped. The fallback must return it untouched.
+    json converseShaped = {"contentBlockIndex": 0, "delta": {"text": "hi"}};
+    [string, json] [eventType, payload] = unwrapNamedEvent(CONVERSE_EVT_CONTENT_BLOCK_DELTA, converseShaped);
+    test:assertEquals(eventType, CONVERSE_EVT_CONTENT_BLOCK_DELTA);
+    test:assertEquals(payload, converseShaped);
+}
+
+@test:Config {}
+function testAnthropicInvokePayloadsAreNotMistakenForNamedEvents() {
+    // Anthropic-on-Invoke carries `type` ALONGSIDE other members, so it is never
+    // single-key and must fall through to the header. A single-key payload whose
+    // key is not a Converse event name must also fall through.
+    json anthropicShaped = {"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "hi"}};
+    [string, json] [eventType, payload] = unwrapNamedEvent("chunk", anthropicShaped);
+    test:assertEquals(eventType, "chunk");
+    test:assertEquals(payload, anthropicShaped);
+
+    [string, json] [pingType, _] = unwrapNamedEvent("chunk", {"type": "ping"});
+    test:assertEquals(pingType, "chunk", "a single-key payload keyed on 'type' is not a Converse event");
+}

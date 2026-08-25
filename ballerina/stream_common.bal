@@ -232,10 +232,11 @@ class BedrockChunkIterator {
         }
 
         json payload = check framePayloadAsJson(frame);
+        string eventType = frame.headers[HDR_EVENT_TYPE] ?: "";
         if self.unwrapBytes {
             payload = check unwrapInvokeChunk(payload);
+            [eventType, payload] = unwrapNamedEvent(eventType, payload);
         }
-        string eventType = frame.headers[HDR_EVENT_TYPE] ?: "";
         ai:ChatCompletionChunk? chunk = check self.decoder.decode(eventType, payload);
         if chunk is () {
             return ();
@@ -296,6 +297,57 @@ class BedrockChunkIterator {
         return err;
     }
 }
+
+// Re-derives the event type for a dialect that names its event in the PAYLOAD
+// rather than in the frame header.
+//
+// FOUND LIVE, 2026-08-24, Nova Pro on `InvokeModelWithResponseStream`: the stream
+// completed cleanly and produced ZERO chunks — no error, no text. On the Invoke
+// route every frame's `:event-type` header is the constant `chunk`, so the event
+// name has to come from somewhere else, and Nova puts it in the single top-level
+// KEY of the payload:
+//
+//     ConverseStream (header):  :event-type: contentBlockDelta
+//                               {"contentBlockIndex":0,"delta":{"text":"hi"}}
+//
+//     Nova on Invoke (key):     :event-type: chunk
+//                               {"contentBlockDelta":{"contentBlockIndex":0,
+//                                                     "delta":{"text":"hi"}}}
+//
+// The decoder matched `chunk` against its event names, found nothing, and skipped
+// every frame — a silent empty stream, which is the worst possible failure shape.
+//
+// Anthropic-on-Invoke is untouched: its payload keys are `type`/`index`/`delta`/
+// `message`/`usage`/`content_block`, none of which collide with a Converse event
+// name, so it falls through to the header and its own decoder reads `type` itself.
+// Falling back to the header keeps ConverseStream working unchanged.
+//
+// The lookup is over EVERY key, not just a single-key payload. Nova's terminal
+// frame is the exception that proves it:
+//
+//     {"metadata": {"usage": {...}, "metrics": {}, "trace": {}},
+//      "amazon-bedrock-invocationMetrics": {...}}
+//
+// Bedrock decorates the last frame with its own invocation metrics, so the payload
+// carries TWO top-level keys. An arity guard drops it, and the usage that rides on
+// `metadata` — the only usage a Converse-shaped stream ever reports — never reaches
+// the caller. The event-name lookup is the discriminator; arity never was.
+isolated function unwrapNamedEvent(string headerEventType, json payload) returns [string, json] {
+    if payload is map<json> {
+        foreach [string, json] [name, inner] in payload.entries() {
+            if isConverseEventName(name) {
+                return [name, inner];
+            }
+        }
+    }
+    return [headerEventType, payload];
+}
+
+// Whether a name is one of the `ConverseStream` event types.
+isolated function isConverseEventName(string name) returns boolean =>
+    name == CONVERSE_EVT_MESSAGE_START || name == CONVERSE_EVT_CONTENT_BLOCK_START ||
+    name == CONVERSE_EVT_CONTENT_BLOCK_DELTA || name == CONVERSE_EVT_CONTENT_BLOCK_STOP ||
+    name == CONVERSE_EVT_MESSAGE_STOP || name == CONVERSE_EVT_METADATA;
 
 // Unwraps an InvokeModelWithResponseStream frame body.
 //

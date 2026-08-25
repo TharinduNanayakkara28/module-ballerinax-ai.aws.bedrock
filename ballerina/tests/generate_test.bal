@@ -230,3 +230,73 @@ function testMistralTextDialectRejectsToolsRatherThanDroppingThem() {
             GEN_PARAMS);
     test:assertTrue(encoded is ai:Error, "tools on a dialect with no tool support must fail loudly");
 }
+
+// ---------------------------------------------------------------------------
+// Object envelope for non-object target types
+// ---------------------------------------------------------------------------
+
+@test:Config {}
+function testObjectSchemaIsSentUnwrapped() {
+    // A record target already has an object root; wrapping it would change the
+    // arguments the model returns for no reason.
+    [map<json>, boolean] [schema, wasObject] = objectEnvelope(REVIEW_SCHEMA);
+    test:assertTrue(wasObject);
+    test:assertEquals(schema, REVIEW_SCHEMA);
+    test:assertEquals(unwrapResult({"sentiment": "positive", "score": 4}, wasObject),
+            {"sentiment": "positive", "score": 4});
+}
+
+@test:Config {}
+function testScalarSchemaIsWrappedInAnObjectRoot() {
+    // REGRESSION, found live 2026-08-25: `generate()` with a `string` target sent
+    // `{"type": "string"}` as the tool input schema and Bedrock rejected it —
+    // "inputSchema.json.type must be one of the following: object" on Converse,
+    // "input_schema.type: Input should be 'object'" on Anthropic-on-Invoke.
+    [map<json>, boolean] [schema, wasObject] = objectEnvelope({"type": "string"});
+    test:assertFalse(wasObject);
+    test:assertEquals(schema, {
+        "type": "object",
+        "properties": {"result": {"type": "string"}},
+        "required": ["result"]
+    });
+    test:assertEquals(unwrapResult({"result": "a joke"}, wasObject), "a joke");
+}
+
+@test:Config {}
+function testArraySchemaIsWrappedInAnObjectRoot() {
+    [map<json>, boolean] [schema, wasObject] = objectEnvelope({"type": "array", "items": {"type": "integer"}});
+    test:assertFalse(wasObject);
+    test:assertEquals(schema, {
+        "type": "object",
+        "properties": {"result": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["result"]
+    });
+    test:assertEquals(unwrapResult({"result": [1, 2, 3]}, wasObject), [1, 2, 3]);
+}
+
+@test:Config {}
+function testSchemaMetadataStaysAtTheEnvelopeRoot() {
+    // `title`/`description` describe the whole tool input, so they belong at the
+    // root; the value keywords move down onto the wrapped property.
+    [map<json>, boolean] [schema, _] = objectEnvelope({
+        "title": "Score",
+        "description": "the score",
+        "type": "integer",
+        "minimum": 0
+    });
+    test:assertEquals(schema, {
+        "title": "Score",
+        "description": "the score",
+        "type": "object",
+        "properties": {"result": {"type": "integer", "minimum": 0}},
+        "required": ["result"]
+    });
+}
+
+@test:Config {}
+function testUnwrapLeavesABareValueAloneOnTheTextFallback() {
+    // A model that answered in prose rather than with a tool call may have written
+    // the bare value. Lifting a missing `result` key would turn that into a null.
+    test:assertEquals(unwrapResult("a joke", false), "a joke");
+    test:assertEquals(unwrapResult({"sentiment": "positive"}, false), {"sentiment": "positive"});
+}

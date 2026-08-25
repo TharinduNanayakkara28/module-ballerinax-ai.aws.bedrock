@@ -127,9 +127,9 @@ function testFramerReturnsNilUntilAFrameIsComplete() {
 
 @test:Config {}
 function testFramerHandlesByteAtATimeDelivery() {
-    // The real read size is ONE byte (see STREAM_READ_SIZE), so frames arrive split
-    // at arbitrary points. Feeding a byte at a time is the production path, not an
-    // edge case.
+    // Production reads 16 bytes at a time (STREAM_READ_SIZE), which never aligns
+    // with a frame boundary, so frames always arrive split at arbitrary points.
+    // A byte at a time is the harshest version of that, and the cheapest to assert.
     byte[] a = converseFrame("contentBlockDelta", "{\"delta\":{\"text\":\"one\"}}");
     byte[] b = converseFrame("contentBlockDelta", "{\"delta\":{\"text\":\"two\"}}");
     EventStreamFramer framer = new;
