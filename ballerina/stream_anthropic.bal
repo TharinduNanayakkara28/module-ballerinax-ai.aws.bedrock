@@ -39,6 +39,9 @@ class AnthropicStreamDecoder {
     *StreamChunkDecoder;
 
     private final ToolIndexMap toolIndex = new;
+    // The prompt-token count, carried from `message_start` to `message_delta` so the
+    // two halves of `usage` reach the caller together. See `decodeMessageStart`.
+    private int promptTokens = 0;
 
     isolated function decode(string eventType, json payload) returns ai:ChatCompletionChunk|ai:Error? {
         map<json> p = payload is map<json> ? payload : {};
@@ -81,6 +84,12 @@ class AnthropicStreamDecoder {
     // token count. Anthropic reports prompt tokens HERE and completion tokens on
     // `message_delta` — the two halves of `usage` arrive in different events, unlike
     // Converse which sends both together in `metadata`.
+    //
+    // The prompt count is STASHED rather than emitted on this chunk. `ai` documents
+    // `usage` as "present only on the final chunk", so a caller reading usage off the
+    // last chunk — the natural reading, and what the non-streaming path returns —
+    // would otherwise see `completionTokens` alone and silently lose the prompt half.
+    // `message_delta` re-joins them.
     private isolated function decodeMessageStart(map<json> p) returns ai:ChatCompletionChunk? {
         map<json>? message = mapField(p, "message");
         ai:ChatCompletionChunk chunk = singleChoiceChunk({role: ai:ASSISTANT});
@@ -99,7 +108,7 @@ class AnthropicStreamDecoder {
         if usage is map<json> {
             int? inputTokens = intField(usage, "input_tokens");
             if inputTokens is int {
-                chunk.usage = {promptTokens: inputTokens};
+                self.promptTokens = inputTokens;
             }
         }
         return chunk;
@@ -165,19 +174,34 @@ class AnthropicStreamDecoder {
     }
 
     // `message_delta` closes the response: the stop reason plus the OUTPUT token
-    // count (the input count came on `message_start`).
+    // count. It is the LAST chunk this decoder emits — `message_stop` and the final
+    // `ping` carry nothing the contract can express — so it is where the complete
+    // `usage` belongs, rejoined with the prompt count stashed on `message_start`.
+    //
+    // `totalTokens` is derived rather than read: Anthropic reports the two halves and
+    // no total, while Converse sends all three. Computing it here means a caller sees
+    // the same fully-populated `usage` on either dialect.
     private isolated function decodeMessageDelta(map<json> p) returns ai:ChatCompletionChunk? {
         map<json>? delta = mapField(p, "delta");
         ai:FinishReason? finishReason = delta is map<json>
             ? mapAnthropicFinishReason(strField(delta, "stop_reason"))
             : ();
         ai:ChatCompletionChunk chunk = singleChoiceChunk({}, finishReason);
+        int? outputTokens = ();
         map<json>? usage = mapField(p, "usage");
         if usage is map<json> {
-            int? outputTokens = intField(usage, "output_tokens");
-            if outputTokens is int {
-                chunk.usage = {completionTokens: outputTokens};
-            }
+            outputTokens = intField(usage, "output_tokens");
+        }
+        if outputTokens is int {
+            chunk.usage = {
+                promptTokens: self.promptTokens,
+                completionTokens: outputTokens,
+                totalTokens: self.promptTokens + outputTokens
+            };
+        } else if self.promptTokens > 0 {
+            // A `message_delta` with no output count still has to carry the prompt
+            // half; dropping it would lose the only usage the response reported.
+            chunk.usage = {promptTokens: self.promptTokens};
         }
         return chunk;
     }

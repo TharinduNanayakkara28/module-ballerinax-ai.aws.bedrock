@@ -94,9 +94,9 @@ class EventStreamFramer {
 
     # Appends freshly-read bytes to the buffer.
     isolated function feed(byte[] chunk) {
-        foreach byte b in chunk {
-            self.buf.push(b);
-        }
+        // Spread, not a per-byte loop: with `STREAM_READ_SIZE` at 16 a loop crosses
+        // the array-growth path once per BYTE for the whole response.
+        self.buf.push(...chunk);
     }
 
     # Pops the next COMPLETE frame, or `()` when more bytes are needed.

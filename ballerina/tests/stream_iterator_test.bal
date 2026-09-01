@@ -31,6 +31,9 @@ class FakeByteStream {
     private final byte[] wire;
     private final int readSize;
     private int pos = 0;
+    // Records that `close()` reached the underlying body — the only observable
+    // difference between releasing a pooled connection and leaking it.
+    private int closeCount = 0;
 
     isolated function init(byte[] wire, int readSize) {
         self.wire = wire;
@@ -46,6 +49,41 @@ class FakeByteStream {
         self.pos = end;
         return {value: chunk};
     }
+
+    public isolated function close() returns io:Error? {
+        self.closeCount += 1;
+        return ();
+    }
+
+    isolated function closes() returns int => self.closeCount;
+}
+
+# Replays a canned chunk sequence, recording whether it was closed. Backs the
+# `ChunkTextIterator` propagation test.
+class FakeChunkSource {
+    private final ai:ChatCompletionChunk[] chunks;
+    private int pos = 0;
+    private boolean closed = false;
+
+    isolated function init(ai:ChatCompletionChunk[] chunks) {
+        self.chunks = chunks;
+    }
+
+    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        if self.pos >= self.chunks.length() {
+            return ();
+        }
+        ai:ChatCompletionChunk chunk = self.chunks[self.pos];
+        self.pos += 1;
+        return {value: chunk};
+    }
+
+    public isolated function close() returns ai:Error? {
+        self.closed = true;
+        return ();
+    }
+
+    isolated function isClosed() returns boolean => self.closed;
 }
 
 # What draining a canned response produced: the chunks delivered, and the error the
@@ -216,6 +254,12 @@ function testAnthropicInvokeStreamPipelineUnwrapsAndDecodes() {
     test:assertEquals(chunks[0].id, "msg_1");
     test:assertEquals(chunks[0].model, "claude-x");
     test:assertEquals(chunks[3].choices[0].finishReason, ai:STOP);
+    // Both halves of usage land together on the final chunk, with the derived total.
+    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunks[3]?.usage;
+    test:assertEquals(usage?.promptTokens, 11);
+    test:assertEquals(usage?.completionTokens, 4);
+    test:assertEquals(usage?.totalTokens, 15);
+    test:assertEquals(chunks[0]?.usage, (), "the opening chunk carries no partial usage");
 }
 
 // ---------------------------------------------------------------------------
@@ -297,4 +341,135 @@ function testGenerateStreamRejectsANonStringTargetType() {
         test:assertFail("generateStream with a record target must be refused");
     }
     test:assertTrue(typed.message().includes("only 'string'"), typed.message());
+}
+
+// ---------------------------------------------------------------------------
+// Closing — releasing the live response
+// ---------------------------------------------------------------------------
+
+@test:Config {}
+function testClosingAPartiallyReadStreamReleasesTheResponseBody() returns error? {
+    // The leak that matters: a caller that breaks out of the `foreach` once it has
+    // seen enough. `close()` is the only hook it has, and without one the
+    // `http:Response` body — and its pooled connection — stays open for the life of
+    // the client.
+    byte[] wire = converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"a\"}}");
+    wire.push(...converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"b\"}}"));
+    wire.push(...converseFrame("messageStop", "{\"stopReason\":\"end_turn\"}"));
+
+    FakeByteStream body = new (wire, 1);
+    stream<byte[], io:Error?> bytes = new (body);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+            bytes, newStreamDecoder(CONVERSE_STREAM), false, "req-abc", "test.model-v1:0",
+            observe:createChatSpan("test.model-v1:0")));
+
+    record {|ai:ChatCompletionChunk value;|}? first = check chunks.next();
+    test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "the first chunk must arrive");
+    test:assertEquals(body.closes(), 0, "reading must not close the body");
+
+    check chunks.close();
+    test:assertEquals(body.closes(), 1, "close() must reach the response byte stream");
+}
+
+@test:Config {}
+function testClosingAnExhaustedStreamIsANoOp() returns error? {
+    // A body read to the end has already returned its connection to the pool, so
+    // closing it again would only risk a spurious 'already closed' error out of
+    // `close()`. Draining then closing must stay silent.
+    byte[] wire = converseFrame("messageStop", "{\"stopReason\":\"end_turn\"}");
+    FakeByteStream body = new (wire, 1);
+    stream<byte[], io:Error?> bytes = new (body);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+            bytes, newStreamDecoder(CONVERSE_STREAM), false, "req-abc", "test.model-v1:0",
+            observe:createChatSpan("test.model-v1:0")));
+
+    _ = check chunks.next(); // messageStop
+    test:assertEquals(check chunks.next(), (), "the stream must end after its last frame");
+
+    check chunks.close();
+    test:assertEquals(body.closes(), 0, "an exhausted body must not be closed again");
+    check chunks.close();
+    test:assertEquals(body.closes(), 0, "close() must stay idempotent");
+}
+
+@test:Config {}
+function testClosingAFailedStreamStillReleasesTheResponseBody() returns error? {
+    // A mid-stream service exception ends the stream with an error, but the body is
+    // NOT drained — the bytes after the exception frame were never read. This is the
+    // path where forgetting to close leaks hardest.
+    byte[] wire = buildFrame({[HDR_MESSAGE_TYPE]: "exception", [HDR_EXCEPTION_TYPE]: "throttlingException"},
+            "{\"message\":\"Too many requests\"}");
+    wire.push(...converseFrame("messageStop", "{\"stopReason\":\"end_turn\"}"));
+
+    FakeByteStream body = new (wire, 1);
+    stream<byte[], io:Error?> bytes = new (body);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+            bytes, newStreamDecoder(CONVERSE_STREAM), false, "req-abc", "test.model-v1:0",
+            observe:createChatSpan("test.model-v1:0")));
+
+    record {|ai:ChatCompletionChunk value;|}|ai:Error? first = chunks.next();
+    test:assertTrue(first is ai:Error, "an exception frame must surface as an error");
+
+    check chunks.close();
+    test:assertEquals(body.closes(), 1, "close() after a failure must still release the body");
+}
+
+@test:Config {}
+function testClosingTheGenerateStreamTextStreamPropagates() returns error? {
+    // `generateStream` hands back a text stream wrapping the chunk stream. Without a
+    // `close()` on the projection, `BedrockChunkIterator.close()` is unreachable
+    // from a `generateStream` caller and the release above never happens.
+    FakeChunkSource chunkSource = new ([
+        singleChoiceChunk({content: "Hello "}),
+        singleChoiceChunk({content: "world"})
+    ]);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (chunkSource);
+    stream<string, ai:Error?> text = new (new ChunkTextIterator(chunks));
+
+    record {|string value;|}? first = check text.next();
+    test:assertEquals(first?.value, "Hello ");
+    test:assertFalse(chunkSource.isClosed(), "reading must not close the chunk stream");
+
+    check text.close();
+    test:assertTrue(chunkSource.isClosed(), "close() must propagate to the chunk stream underneath");
+}
+
+@test:Config {}
+function testAFailedStreamStaysEnded() {
+    // A mid-stream exception frame ends the stream. The bytes AFTER it are still
+    // buffered and still decodable, so without a terminal state a consumer that
+    // keeps pulling past the error is handed the rest of the answer as though
+    // nothing had gone wrong.
+    byte[] wire = converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial\"}}");
+    wire.push(...buildFrame({[HDR_MESSAGE_TYPE]: "exception", [HDR_EXCEPTION_TYPE]: "modelStreamErrorException"},
+            "{\"message\":\"boom\"}"));
+    wire.push(...converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\" more\"}}"));
+    wire.push(...converseFrame("messageStop", "{\"stopReason\":\"end_turn\"}"));
+
+    stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, 1));
+    BedrockChunkIterator iterator = new (bytes, newStreamDecoder(CONVERSE_STREAM), false,
+            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0"));
+
+    record {|ai:ChatCompletionChunk value;|}|ai:Error? first = iterator.next();
+    test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "the text before the exception arrives");
+    test:assertTrue(iterator.next() is ai:Error, "the exception frame surfaces as an error");
+
+    test:assertTrue(iterator.next() is (), "a failed stream must stay ended");
+    test:assertTrue(iterator.next() is (), "and stay ended on every further pull");
+}
+
+@test:Config {}
+function testAClosedStreamStopsYielding() returns error? {
+    // Closing mid-response must also be terminal — a caller that broke out early and
+    // then pulled again would otherwise resume reading a response it had released.
+    byte[] wire = converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"a\"}}");
+    wire.push(...converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"b\"}}"));
+
+    stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, 1));
+    BedrockChunkIterator iterator = new (bytes, newStreamDecoder(CONVERSE_STREAM), false,
+            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0"));
+
+    test:assertTrue(iterator.next() is record {|ai:ChatCompletionChunk value;|}, "the first chunk arrives");
+    check iterator.close();
+    test:assertTrue(iterator.next() is (), "a closed stream must not resume");
 }

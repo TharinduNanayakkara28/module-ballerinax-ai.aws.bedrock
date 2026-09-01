@@ -31,7 +31,27 @@ ai:ChatAssistantMessage response = check claude->chat([
 ]);
 ```
 
-## Two things that will silently cost you
+## Streaming
+
+```ballerina
+stream<string, ai:Error?> text = check claude->generateStream(`Explain SigV4 in three sentences.`);
+check from string fragment in text
+    do {
+        io:print(fragment);
+    };
+```
+
+`chatStream()` gives the same response as normalized `ai:ChatCompletionChunk`s, carrying content,
+reasoning, tool-call fragments, finish reason and usage. Supported on the **Converse** route for every
+vendor, and on Invoke for Claude and Nova; any other route is refused before the network call, naming
+`apiFamily = bedrock:CONVERSE` as the remedy. Only a `string` target streams — use `generate()` for
+typed results.
+
+## Three things that will silently cost you
+
+**Streaming needs the separate `bedrock:InvokeModelWithResponseStream` IAM action.** It is not covered
+by the `bedrock:InvokeModel` that `chat()` uses — `ConverseStream` included — so a role that chats
+fine can be denied on `chatStream()` alone.
 
 **Mantle needs the separate `bedrock-mantle:CreateInference` IAM action.** Working `bedrock:InvokeModel`
 permissions are **not** enough — otherwise you get `AccessDenied` with no clue why.

@@ -34,6 +34,10 @@ type StreamChunkDecoder object {
 };
 
 # Which native stream dialect a route speaks.
+#
+# Carried on `ModelCodec.streamDialect`, so a route's dialect is settled by the same
+# selection that settles its codec — see the field's own note for why it is not
+# derived from the model id.
 enum StreamDialect {
     # `ConverseStream` events — and Nova on `InvokeModelWithResponseStream`, whose
     # framed payloads are Converse-shaped (the same pairing that lets
@@ -41,27 +45,6 @@ enum StreamDialect {
     CONVERSE_STREAM,
     # Anthropic's own event model on `InvokeModelWithResponseStream`.
     ANTHROPIC_STREAM
-}
-
-// Picks the stream dialect for a resolved route.
-//
-// Only reachable for a route whose codec sets `supportsStreaming` — `runChatStream`
-// checks that first — so the three cases here are exactly the three codecs carrying
-// that flag. A route that slipped through without one is a wiring bug, not a user
-// error, hence the internal-sounding message.
-isolated function selectStreamDialect(ApiFamily family, string bareModelId) returns StreamDialect|ai:Error {
-    if family == CONVERSE {
-        return CONVERSE_STREAM; // model-agnostic — one dialect for every vendor
-    }
-    if family == INVOKE {
-        if bareModelId.startsWith("anthropic.") {
-            return ANTHROPIC_STREAM;
-        }
-        if bareModelId.startsWith("amazon.nova") {
-            return CONVERSE_STREAM; // Converse-shaped payloads inside the frames
-        }
-    }
-    return error ai:Error(string `No streaming dialect for '${bareModelId}' on the ${family} route`);
 }
 
 // Builds a fresh decoder for one response.

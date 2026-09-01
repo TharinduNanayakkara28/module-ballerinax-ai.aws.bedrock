@@ -70,20 +70,22 @@ const string EVENTSTREAM_MSG_TYPE_EXCEPTION = "exception";
 // holding mutable framing state (a partially-filled byte buffer, the tool-index
 // map) that necessarily outlives this call. `ai:ModelProvider` does not declare
 // `chatStream` isolated either, so the facades match the contract.
-function runChatStream(string providerName, ApiFamily family, string wireModelId, string bareModelId,
+function runChatStream(string providerName, ApiFamily family, string wireModelId,
         readonly & ModelCodec codec, BedrockTransport transport, map<string> & readonly extraHeaders,
         readonly & InferenceParams params, ai:ChatMessage[]|ai:ChatUserMessage messages,
         ai:ChatCompletionFunctions[] tools, string? stop)
         returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
     // Refused BEFORE any I/O, naming the escape hatch — the same shape as the
-    // module's other capability guards. `supportsStreaming` has been carried on
-    // every codec since the module shipped; this is what finally reads it.
-    if !codec.supportsStreaming {
+    // module's other capability guards. The codec carries its own dialect, so the
+    // capability check and the dialect it implies are one lookup and cannot
+    // disagree — including on an opaque ARN, whose codec `selectCodec` resolves
+    // from `modelSchema` rather than from the (ARN-valued) model id.
+    StreamDialect? dialect = codec.streamDialect;
+    if dialect is () {
         return error ai:Error(string `Streaming is not supported for model '${wireModelId}' on the ` +
             string `${family} route. Use 'apiFamily = CONVERSE' — ConverseStream is model-agnostic ` +
             string `and streams every vendor.`);
     }
-    StreamDialect dialect = check selectStreamDialect(family, bareModelId);
 
     ai:ChatMessage[] msgs;
     if messages is ai:ChatUserMessage {
@@ -164,6 +166,11 @@ class BedrockChunkIterator {
     private int completionTokens = 0;
     private string finishReason = "";
     private boolean closed = false;
+    // Whether the response byte stream still holds a connection. Set once the body
+    // is drained, so `close()` can skip a stream that is already exhausted: the
+    // entity is fully read and the connection back in the pool by then, and closing
+    // it anyway risks a spurious "already closed" error out of `close()`.
+    private boolean bytesReleased = false;
 
     isolated function init(stream<byte[], io:Error?> bytes, StreamChunkDecoder decoder, boolean unwrapBytes,
             string? responseId, string wireModelId, observe:ChatSpan span) {
@@ -176,6 +183,14 @@ class BedrockChunkIterator {
     }
 
     public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        // Once the stream has ended — cleanly, on an error, or because the caller
+        // closed it — it stays ended. Without this, a consumer that keeps pulling
+        // after a reported failure re-enters the read loop and can be handed MORE
+        // chunks: exactly the half-answer-read-as-whole that surfacing the exception
+        // frame exists to prevent.
+        if self.closed {
+            return ();
+        }
         while true {
             EventStreamFrame|ai:Error? frame = self.framer.nextFrame();
             if frame is ai:Error {
@@ -202,6 +217,7 @@ class BedrockChunkIterator {
                 return self.failWith(error ai:LlmConnectionError("Bedrock stream failed mid-response", next));
             }
             if next is () {
+                self.bytesReleased = true;
                 // End of body. A leftover partial frame means the response was cut
                 // short; reporting it beats presenting a truncated answer as complete.
                 if self.framer.hasPartialFrame() {
@@ -283,6 +299,12 @@ class BedrockChunkIterator {
         self.span.addOutputTokenCount(self.completionTokens);
         if self.finishReason != "" {
             self.span.addFinishReason(self.finishReason);
+            // Paired with the finish reason, as in the reference iterator. `TEXT` is
+            // the only honest value: `observe:OutputType` is TEXT|JSON, and a chat
+            // stream is text deltas even when some of them carry tool-call
+            // fragments — structured output never streams (see
+            // `generateLlmResponseStream`).
+            self.span.addOutputType(observe:TEXT);
         }
         self.span.close();
     }
@@ -295,6 +317,29 @@ class BedrockChunkIterator {
             self.span.close(err);
         }
         return err;
+    }
+
+    // Releases the live response and closes the span.
+    //
+    // Closing the stream is the ONLY hook a consumer that stops early has — breaking
+    // out of a `foreach` once it has seen enough, or abandoning the stream after a
+    // mid-stream error. Without this the `http:Response` body is left open, leaking a
+    // pooled connection per abandoned stream until the pool is exhausted, and the
+    // span dangles unclosed.
+    //
+    // Idempotent on both halves: the span close guards on `closed` (and is already a
+    // no-op after a failure), and the byte stream is skipped once drained or closed.
+    public isolated function close() returns ai:Error? {
+        self.finish();
+        if self.bytesReleased {
+            return ();
+        }
+        self.bytesReleased = true;
+        io:Error? err = self.bytes.close();
+        if err is io:Error {
+            return error ai:LlmConnectionError("Failed to close the Bedrock response byte stream", err);
+        }
+        return ();
     }
 }
 
@@ -431,5 +476,15 @@ class ChunkTextIterator {
                 return {value: text};
             }
         }
+    }
+
+    // Propagates the close to the chunk stream underneath.
+    //
+    // Without this, closing the `generateStream` text stream releases nothing: the
+    // wrapped chunk stream — and through it the live HTTP response — stays open, so
+    // the `BedrockChunkIterator` release would be unreachable from a `generateStream`
+    // caller.
+    public isolated function close() returns ai:Error? {
+        return self.chunks.close();
     }
 }

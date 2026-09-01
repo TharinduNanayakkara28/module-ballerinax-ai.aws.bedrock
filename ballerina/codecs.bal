@@ -21,7 +21,7 @@ final readonly & ModelCodec CONVERSE_CODEC = {
     encode: encodeConverse,
     decode: decodeConverse,
     toolChoice: CONVERSE_TOOL_CHOICE,
-    supportsStreaming: true
+    streamDialect: CONVERSE_STREAM
 };
 
 // Invoke-Anthropic — `anthropic_version: bedrock-2023-05-31` body field (§7.2).
@@ -29,7 +29,7 @@ final readonly & ModelCodec INVOKE_ANTHROPIC_CODEC = {
     encode: encodeInvokeAnthropic,
     decode: decodeAnthropicMessages,
     toolChoice: ANTHROPIC_TOOL_CHOICE,
-    supportsStreaming: true
+    streamDialect: ANTHROPIC_STREAM
 };
 
 // Mantle Messages — `anthropic-version: 2023-06-01` header (added by transport, §7.3).
@@ -37,7 +37,7 @@ final readonly & ModelCodec MANTLE_MESSAGES_CODEC = {
     encode: encodeMantleMessages,
     decode: decodeAnthropicMessages,
     toolChoice: ANTHROPIC_TOOL_CHOICE,
-    supportsStreaming: false
+    streamDialect: ()
 };
 
 // Mantle Responses — OpenAI Responses API (GPT-5.x on `/openai/v1/responses`, §7.3).
@@ -47,7 +47,7 @@ final readonly & ModelCodec MANTLE_RESPONSES_CODEC = {
     // Responses forces tools with a FLAT `tool_choice`, unlike the Chat Completions
     // codecs below — same vendor, different dialect.
     toolChoice: RESPONSES_TOOL_CHOICE,
-    supportsStreaming: false
+    streamDialect: ()
 };
 
 // Mantle Chat Completions — OpenAI chat shape (GLM on `/v1/chat/completions`, §7.3).
@@ -55,7 +55,7 @@ final readonly & ModelCodec MANTLE_CHAT_CODEC = {
     encode: encodeOpenAIChat,
     decode: decodeOpenAIChat,
     toolChoice: OPENAI_CHAT_TOOL_CHOICE,
-    supportsStreaming: false
+    streamDialect: ()
 };
 
 // Nova InvokeModel — `schemaVersion: messages-v1`; Converse-shaped response (§7.2).
@@ -65,7 +65,7 @@ final readonly & ModelCodec INVOKE_NOVA_CODEC = {
     encode: encodeNovaInvoke,
     decode: decodeConverse,
     toolChoice: CONVERSE_TOOL_CHOICE,
-    supportsStreaming: true
+    streamDialect: CONVERSE_STREAM
 };
 
 // OpenAI-shaped InvokeModel — GPT-OSS, Qwen, DeepSeek (§7.2). NOT Mistral: that
@@ -74,7 +74,7 @@ final readonly & ModelCodec INVOKE_OPENAI_CHAT_CODEC = {
     encode: encodeOpenAIChat,
     decode: decodeOpenAIChat,
     toolChoice: OPENAI_CHAT_TOOL_CHOICE,
-    supportsStreaming: false
+    streamDialect: ()
 };
 
 // Invoke-DeepSeek — text completion: `prompt` → `choices[].text`. NOT the OpenAI
@@ -83,7 +83,7 @@ final readonly & ModelCodec INVOKE_DEEPSEEK_CODEC = {
     encode: encodeDeepSeekInvoke,
     decode: decodeDeepSeekInvoke,
     toolChoice: NO_TOOL_CHOICE,
-    supportsStreaming: false
+    streamDialect: ()
 };
 
 // Invoke-Mistral chat completion — `messages`/`choices`, `tool_choice: "any"` (§7.2).
@@ -91,7 +91,7 @@ final readonly & ModelCodec INVOKE_MISTRAL_CHAT_CODEC = {
     encode: encodeMistralChat,
     decode: decodeMistralChat,
     toolChoice: MISTRAL_TOOL_CHOICE,
-    supportsStreaming: false
+    streamDialect: ()
 };
 
 // Invoke-Mistral text completion — `prompt`/`outputs`; no tools at all (§7.2).
@@ -99,7 +99,7 @@ final readonly & ModelCodec INVOKE_MISTRAL_TEXT_CODEC = {
     encode: encodeMistralText,
     decode: decodeMistralText,
     toolChoice: NO_TOOL_CHOICE,
-    supportsStreaming: false
+    streamDialect: ()
 };
 
 // Selects the codec for a resolved route (design §7.2, §7.3). Runs at construction

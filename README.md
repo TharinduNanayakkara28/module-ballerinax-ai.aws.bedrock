@@ -87,6 +87,62 @@ Review review = check claude->generate(`Rate this review: ${text}`);
 > tool-calling at all. This only bites when you force `apiFamily = INVOKE` on those ids — the default
 > Converse route supports typed generation for every Mistral model.
 
+### Streaming — `chatStream()` and `generateStream()`
+
+```ballerina
+stream<ai:ChatCompletionChunk, ai:Error?> chunks = check claude->chatStream([
+    {role: ai:USER, content: "Explain SigV4 in three sentences."}
+]);
+check from ai:ChatCompletionChunk chunk in chunks
+    do {
+        io:print(chunk.choices[0].delta.content ?: "");
+    };
+```
+
+`generateStream()` is the text-only shortcut — it projects the same stream onto its content
+fragments, skipping the role opener, tool-call fragments and the usage closer:
+
+```ballerina
+stream<string, ai:Error?> text = check claude->generateStream(`Explain SigV4 in three sentences.`);
+check from string fragment in text
+    do {
+        io:print(fragment);
+    };
+```
+
+**Only `string` streams.** `generateStream()` with any other target type is an `ai:Error`: structured
+output is obtained by forcing a tool call, and the arguments cannot be bound until the whole JSON has
+arrived — there is no partial record to hand back. Use `generate()` for typed results.
+
+**Close the stream if you stop early.** Breaking out of the loop leaves the HTTP response open; a
+`chunks.close()` releases it (and the observability span). Draining to the end closes itself.
+
+Chunks are normalized to the `ai:ChatCompletionChunk` shape, so the same consumer code works across
+vendors. Beyond `delta.content` a chunk may carry `delta.reasoning` (extended thinking — Claude and
+Nova stream it as readable text), `delta.toolCalls` (partial-JSON argument fragments, correlated by
+`index`), `finishReason` on the closing chunk, and `usage` on the final one.
+
+#### Which routes stream
+
+| Route | Streams? | Operation |
+| --- | --- | --- |
+| **Converse** (the default) | ✅ every vendor | `ConverseStream` |
+| Invoke + Claude | ✅ | `InvokeModelWithResponseStream` |
+| Invoke + Nova | ✅ | `InvokeModelWithResponseStream` |
+| Invoke + OpenAI / Qwen / DeepSeek / Mistral | ❌ | — |
+| Mantle | ❌ | — |
+
+An unsupported route is refused **before any network call**, with an error naming
+`apiFamily = bedrock:CONVERSE` as the remedy — `ConverseStream` is model-agnostic and streams every
+vendor, so it is almost always the answer. An `imported-model/` ARN streams on whichever dialect its
+`modelSchema` selects (`ANTHROPIC` or `NOVA`).
+
+> **Streaming needs its own IAM action.** Both streaming operations are authorized by
+> **`bedrock:InvokeModelWithResponseStream`**, which is *separate* from the `bedrock:InvokeModel` that
+> `Converse` and `InvokeModel` use — `ConverseStream` included, despite the name. A role that calls
+> `chat()` happily can get an `AccessDenied` on `chatStream()` and nothing else. Grant both actions.
+> See [Actions for Amazon Bedrock](https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonbedrock.html).
+
 ### Mistral speaks two InvokeModel dialects
 
 Mistral is the one vendor whose `InvokeModel` wire shape cannot be derived from its vendor prefix:
@@ -128,7 +184,15 @@ ai:Embedding vector = check titan->embed({content: "hello", 'type: "text-chunk"}
 `batchEmbed` preserves input order. Note the wire asymmetry: Titan's `inputText` is a single string, so
 n chunks is n sequential round trips; Cohere batches up to 96 per call.
 
-## ⚠️ Two callouts that will silently cost you
+## ⚠️ Three callouts that will silently cost you
+
+### **Streaming needs a separate IAM permission**
+
+**`bedrock:InvokeModelWithResponseStream` is its own IAM action**, not something `bedrock:InvokeModel`
+covers — and that holds for `ConverseStream` too, despite the shared endpoint. A role that calls
+`chat()` all day can be denied on `chatStream()` alone, and nothing about the failure says which action
+is missing. (This module's 403 names it for you.) See
+[Streaming](#streaming--chatstream-and-generatestream).
 
 ### **Mantle needs a separate IAM permission**
 
@@ -296,6 +360,7 @@ the standard behaviour for `ballerina-library` connector repos and is used by th
 
 ## Not implemented
 
-Streaming (the codec seam exists, but no `decodeStream`), image/video/audio embeddings and
-`StartAsyncInvoke` (the `ai:Chunk` contract carries text), provisioned-throughput embedding ARNs, and
-Meta/Llama.
+Streaming on the **Mantle** route (its surface is SSE on the same path with `"stream": true` in the
+body, a third dialect) and on the Invoke route for **OpenAI / Qwen / DeepSeek / Mistral** — see
+[Which routes stream](#which-routes-stream). Also image/video/audio embeddings and `StartAsyncInvoke`
+(the `ai:Chunk` contract carries text), provisioned-throughput embedding ARNs, and Meta/Llama.

@@ -230,8 +230,17 @@ type ModelCodec record {|
     # How structured generation forces the single result tool on this dialect (§8).
     # Lives on the codec because tool-choice tracks the wire shape, not the route family.
     ToolChoiceStyle toolChoice;
-    # Whether this dialect has a streaming decoder. Read by `runChatStream`, which
-    # refuses `chatStream` before any I/O when it is false. Must stay in step with
-    # `selectStreamDialect` — `testEveryCodecClaimingStreamingHasADialect` pins that.
-    boolean supportsStreaming;
+    # The native stream dialect this codec's route speaks, or `()` where the route
+    # has no streaming decoder. Read by `runChatStream`, which refuses `chatStream`
+    # before any I/O when it is `()`.
+    #
+    # ONE field rather than a `supportsStreaming` flag beside a separate id-based
+    # dialect lookup. The two were derived independently and could disagree: a
+    # lookup keyed on the model id answered `()` for an opaque ARN — whose
+    # `bareModelId` IS the ARN string, matching no vendor prefix — while the flag
+    # still said `true`, so `chatStream` failed on every ARN route that `chat`
+    # served fine. Hanging the dialect off the codec makes that state
+    # unrepresentable: `selectCodec` already resolves an ARN's dialect from
+    # `modelSchema`, and whatever it picks carries its own answer.
+    StreamDialect? streamDialect;
 |};

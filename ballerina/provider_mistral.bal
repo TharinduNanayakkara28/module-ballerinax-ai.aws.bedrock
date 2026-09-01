@@ -53,9 +53,6 @@ public isolated distinct client class MistralModelProvider {
 
     private final ApiFamily family;
     private final string wireModelId;
-    // Kept alongside `wireModelId` for streaming: the stream DIALECT is chosen from
-    // the bare (geo-prefix-stripped) id, which `wireModelId` no longer carries.
-    private final string bareModelId;
     private final readonly & ModelCodec codec;
     private final BedrockTransport transport;
     private final readonly & InferenceParams params;
@@ -90,7 +87,6 @@ public isolated distinct client class MistralModelProvider {
 
         self.family = route.family;
         self.wireModelId = route.effectiveModelId;
-        self.bareModelId = route.bareModelId;
         self.codec = codec;
         self.transport = transport;
         self.supportsStructuredOutput = route.family != MANTLE; // amendment
@@ -136,7 +132,7 @@ public isolated distinct client class MistralModelProvider {
     remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools = [], string? stop = ())
             returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error
-        => runChatStream("Mistral", self.family, self.wireModelId, self.bareModelId, self.codec,
+        => runChatStream("Mistral", self.family, self.wireModelId, self.codec,
             self.transport, self.extraHeaders, self.params, messages, tools, stop);
 
     # Streams a generated value as it is produced. Only a `string` target type is

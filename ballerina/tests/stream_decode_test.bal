@@ -178,8 +178,10 @@ function testAnthropicStreamMapsMessageStartIdentityAndInputTokens() {
     test:assertEquals(chunk.id, "msg_01ABC");
     test:assertEquals(chunk.model, "claude-sonnet-5");
     test:assertEquals(deltaOf(chunk).role, ai:ASSISTANT);
-    // Anthropic splits usage across two events; the input half lands here.
-    test:assertEquals((<ai:CompletionTokenUsage>chunk?.usage)?.promptTokens, 25);
+    // Anthropic splits usage across two events. The input half is STASHED, not
+    // emitted here: `ai` documents usage as present only on the final chunk, so it
+    // is rejoined with the output half on `message_delta` — see the test below.
+    test:assertEquals(chunk?.usage, (), "the opening chunk must carry no partial usage");
 }
 
 @test:Config {}
@@ -241,6 +243,45 @@ function testAnthropicStreamMapsMessageDeltaStopAndOutputTokens() {
 }
 
 @test:Config {}
+function testAnthropicStreamRejoinsBothHalvesOfUsageOnTheFinalChunk() {
+    // The two halves arrive on different events; a caller reading `usage` off the
+    // last chunk — the natural reading, and what the non-streaming path returns —
+    // must see both, plus the total Anthropic never sends.
+    AnthropicStreamDecoder decoder = new;
+    _ = decodeOne(decoder, "chunk", {
+        "type": "message_start",
+        "message": {"id": "msg_1", "role": "assistant", "usage": {"input_tokens": 25}}
+    });
+    ai:ChatCompletionChunk last = decodeOne(decoder, "chunk", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {"output_tokens": 99}
+    });
+    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>last?.usage;
+    test:assertEquals(usage?.promptTokens, 25);
+    test:assertEquals(usage?.completionTokens, 99);
+    test:assertEquals(usage?.totalTokens, 124, "totalTokens is derived — Anthropic reports no total");
+}
+
+@test:Config {}
+function testAnthropicStreamKeepsThePromptHalfWhenNoOutputCountArrives() {
+    // A `message_delta` with no `usage` must not drop the only count the response
+    // reported.
+    AnthropicStreamDecoder decoder = new;
+    _ = decodeOne(decoder, "chunk", {
+        "type": "message_start",
+        "message": {"role": "assistant", "usage": {"input_tokens": 25}}
+    });
+    ai:ChatCompletionChunk last = decodeOne(decoder, "chunk", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"}
+    });
+    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>last?.usage;
+    test:assertEquals(usage?.promptTokens, 25);
+    test:assertEquals(usage?.completionTokens, ());
+}
+
+@test:Config {}
 function testAnthropicStreamSurfacesAnErrorEvent() {
     // A mid-stream failure must not look like a clean end of generation.
     AnthropicStreamDecoder decoder = new;
@@ -277,46 +318,66 @@ function testAnthropicFinishReasonMapping() {
 // ---------------------------------------------------------------------------
 
 @test:Config {}
-function testStreamDialectSelection() {
-    // Converse is model-agnostic — every vendor, one dialect.
-    test:assertEquals(checkpanic selectStreamDialect(CONVERSE, "anthropic.claude-sonnet-5"), CONVERSE_STREAM);
-    test:assertEquals(checkpanic selectStreamDialect(CONVERSE, "mistral.mistral-large-2407"), CONVERSE_STREAM);
+function testStreamDialectIsCarriedByTheCodec() returns error? {
+    // Converse is model-agnostic — every vendor, one dialect, one codec.
+    // A runtime-only Claude: `claude-sonnet-5` would auto-route to Mantle, which has
+    // no streaming dialect yet.
+    test:assertEquals((check selectCodec(check resolveRoute("anthropic.claude-sonnet-4-6", REGION))).streamDialect,
+            CONVERSE_STREAM);
+    test:assertEquals((check selectCodec(check resolveRoute("mistral.mistral-large-2407", REGION))).streamDialect,
+            CONVERSE_STREAM);
 
     // On Invoke the dialect is the vendor's own.
-    test:assertEquals(checkpanic selectStreamDialect(INVOKE, "anthropic.claude-opus-5"), ANTHROPIC_STREAM);
+    test:assertEquals(INVOKE_ANTHROPIC_CODEC.streamDialect, ANTHROPIC_STREAM);
     // Nova's Invoke frames are Converse-shaped — the same pairing that lets
     // INVOKE_NOVA_CODEC reuse decodeConverse.
-    test:assertEquals(checkpanic selectStreamDialect(INVOKE, "amazon.nova-pro-v1:0"), CONVERSE_STREAM);
+    test:assertEquals(INVOKE_NOVA_CODEC.streamDialect, CONVERSE_STREAM);
 }
 
 @test:Config {}
-function testStreamDialectRejectsAnUnsupportedInvokeVendor() {
-    StreamDialect|ai:Error dialect = selectStreamDialect(INVOKE, "mistral.mistral-large-2407");
-    test:assertTrue(dialect is ai:Error, "Mistral has no Invoke streaming dialect implemented");
+function testCodecsWithoutAStreamingDecoderCarryNoDialect() {
+    // The refusal in `runChatStream` is exactly `streamDialect is ()`, so these are
+    // the routes that get the clean "use apiFamily = CONVERSE" error.
+    test:assertEquals(INVOKE_MISTRAL_CHAT_CODEC.streamDialect, (), "Mistral has no Invoke streaming dialect");
+    test:assertEquals(INVOKE_MISTRAL_TEXT_CODEC.streamDialect, ());
+    test:assertEquals(INVOKE_OPENAI_CHAT_CODEC.streamDialect, ());
+    test:assertEquals(INVOKE_DEEPSEEK_CODEC.streamDialect, ());
+    // Mantle streams as SSE on the same path; that dialect is not implemented.
+    test:assertEquals(MANTLE_MESSAGES_CODEC.streamDialect, ());
+    test:assertEquals(MANTLE_RESPONSES_CODEC.streamDialect, ());
+    test:assertEquals(MANTLE_CHAT_CODEC.streamDialect, ());
 }
 
 @test:Config {}
-function testEveryCodecClaimingStreamingHasADialect() {
-    // The guard in `runChatStream` reads `supportsStreaming`, then
-    // `selectStreamDialect` must succeed. If a codec ever claims streaming without
-    // a matching dialect the pair has drifted, and a caller would get an
-    // internal-sounding error instead of a clean refusal.
-    test:assertTrue(CONVERSE_CODEC.supportsStreaming);
-    test:assertTrue(INVOKE_ANTHROPIC_CODEC.supportsStreaming);
-    test:assertTrue(INVOKE_NOVA_CODEC.supportsStreaming);
+function testEveryCodecsDialectMatchesItsDecoder() {
+    // A dialect names the decoder that reads that codec's frames. If a codec is ever
+    // given a dialect whose decoder cannot read its wire shape, the stream decodes to
+    // silence rather than failing — so the pairing is pinned here.
+    test:assertTrue(newStreamDecoder(<StreamDialect>CONVERSE_CODEC.streamDialect) is ConverseStreamDecoder);
+    test:assertTrue(newStreamDecoder(<StreamDialect>INVOKE_NOVA_CODEC.streamDialect) is ConverseStreamDecoder);
+    test:assertTrue(newStreamDecoder(<StreamDialect>INVOKE_ANTHROPIC_CODEC.streamDialect) is AnthropicStreamDecoder);
+}
 
-    test:assertTrue(selectStreamDialect(CONVERSE, "anything.at.all") is StreamDialect);
-    test:assertTrue(selectStreamDialect(INVOKE, "anthropic.claude-opus-5") is StreamDialect);
-    test:assertTrue(selectStreamDialect(INVOKE, "amazon.nova-lite-v1:0") is StreamDialect);
+@test:Config {}
+function testArnRoutedInvokeModelStillResolvesAStreamDialect() returns error? {
+    // REGRESSION. The dialect used to be looked up from `bareModelId`, which for an
+    // opaque ARN IS the ARN string — matching no vendor prefix. So an imported-model
+    // ARN with `modelSchema` got a codec claiming streaming and then failed dialect
+    // selection every time: `chat()` worked and `chatStream()` never did, with an
+    // internal-sounding "No streaming dialect for 'arn:aws:...'" message.
+    string arn = "arn:aws:bedrock:us-west-2:123456789012:imported-model/abc123def456";
 
-    // And the converse: the codecs that do NOT claim streaming stay refused.
-    test:assertFalse(MANTLE_MESSAGES_CODEC.supportsStreaming);
-    test:assertFalse(MANTLE_RESPONSES_CODEC.supportsStreaming);
-    test:assertFalse(MANTLE_CHAT_CODEC.supportsStreaming);
-    test:assertFalse(INVOKE_OPENAI_CHAT_CODEC.supportsStreaming);
-    test:assertFalse(INVOKE_DEEPSEEK_CODEC.supportsStreaming);
-    test:assertFalse(INVOKE_MISTRAL_CHAT_CODEC.supportsStreaming);
-    test:assertFalse(INVOKE_MISTRAL_TEXT_CODEC.supportsStreaming);
+    Route claude = check resolveRoute(arn, REGION, {modelSchema: ANTHROPIC});
+    test:assertEquals(claude.bareModelId, arn, "an opaque ARN is its own bare id — the old lookup key");
+    test:assertEquals((check selectCodec(claude, ANTHROPIC)).streamDialect, ANTHROPIC_STREAM);
+
+    Route nova = check resolveRoute(arn, REGION, {modelSchema: NOVA});
+    test:assertEquals((check selectCodec(nova, NOVA)).streamDialect, CONVERSE_STREAM);
+
+    // And an ARN that resolves to Converse streams like any other Converse route.
+    Route provisioned = check resolveRoute(
+            "arn:aws:bedrock:eu-west-1:123456789012:provisioned-model/xyz", REGION);
+    test:assertEquals((check selectCodec(provisioned)).streamDialect, CONVERSE_STREAM);
 }
 
 // ---------------------------------------------------------------------------

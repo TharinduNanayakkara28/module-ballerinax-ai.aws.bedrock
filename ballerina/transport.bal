@@ -130,7 +130,7 @@ isolated client class BedrockTransport {
             returns [http:Response, map<string>]|ai:Error {
         string? path = self.streamPath;
         if path is () {
-            // Mantle today. Reached only if a codec claims `supportsStreaming`
+            // Mantle today. Reached only if a codec carries a `streamDialect`
             // without a stream path being built for its route — a wiring bug.
             return error ai:Error("This Bedrock route has no streaming endpoint");
         }
@@ -181,7 +181,7 @@ isolated client class BedrockTransport {
         http:Response response = resp;
         int status = response.statusCode;
         if status < 200 || status >= 300 {
-            return self.mapErrorStatus(response);
+            return self.mapErrorStatus(response, streaming = true);
         }
         // The request id is the only response header the stream needs: the event
         // payloads carry no completion id of their own, and the `ai` contract wants
@@ -221,10 +221,11 @@ isolated client class BedrockTransport {
     }
 
     // Non-2xx -> a typed error. EXTRACTED from `mapResponse` so the streaming path
-    // shares the exact same status table: a 403 on `converse-stream` must carry the
-    // same IAM hint as a 403 on `converse`, and duplicating the table would let the
-    // two drift.
-    isolated function mapErrorStatus(http:Response resp) returns RetryableError|ai:Error {
+    // shares the exact same status table — duplicating it would let the two drift.
+    // `streaming` only selects the 403 hint, where the two routes genuinely differ:
+    // the missing IAM action is `bedrock:InvokeModelWithResponseStream`, not
+    // `bedrock:InvokeModel`.
+    isolated function mapErrorStatus(http:Response resp, boolean streaming = false) returns RetryableError|ai:Error {
         int status = resp.statusCode;
         string detail = self.errorDetail(resp);
         boolean mantle = self.isMantleRoute;
@@ -240,10 +241,21 @@ isolated client class BedrockTransport {
                     string `The model may not support this route; try 'apiFamily = INVOKE' (or CONVERSE).`);
             }
             403 => {
-                string hint = mantle
-                    ? " Mantle needs the separate 'bedrock-mantle:CreateInference' IAM action — " +
-                        "'bedrock:InvokeModel' permissions are NOT sufficient."
-                    : "";
+                // The likely missing action differs per route, and naming the wrong
+                // one sends the reader to the wrong policy. Streaming is its OWN IAM
+                // action on both runtime operations — `ConverseStream` included,
+                // despite being authorized separately from `Converse` — so a role
+                // that calls `chat` fine can still be denied `chatStream`.
+                string hint;
+                if mantle {
+                    hint = " Mantle needs the separate 'bedrock-mantle:CreateInference' IAM action — " +
+                        "'bedrock:InvokeModel' permissions are NOT sufficient.";
+                } else if streaming {
+                    hint = " Streaming needs the separate 'bedrock:InvokeModelWithResponseStream' IAM " +
+                        "action — 'bedrock:InvokeModel' alone covers 'chat' but NOT 'chatStream'.";
+                } else {
+                    hint = "";
+                }
                 return error ai:Error(string `Bedrock AccessDeniedException (HTTP 403): ${detail}.${hint}`);
             }
             404 => {
