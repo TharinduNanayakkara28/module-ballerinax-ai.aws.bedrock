@@ -16,7 +16,6 @@ import ballerina/ai;
 import ballerina/ai.observe;
 import ballerina/http;
 import ballerina/io;
-import ballerina/lang.array;
 
 // The streaming spine — `chatStream` for every vendor facade, plus the
 // `generateStream` text projection. Mirrors `runChat` in provider_common.bal: the
@@ -58,11 +57,10 @@ import ballerina/lang.array;
 // is buffered short of the array size waits for the next frame, so the trailing
 // fragment of the last token surfaces late. End-of-stream always flushes it, so
 // nothing is lost — only briefly delayed.
+//
+// Applies to the event-stream wire only. Mantle's SSE body is read by the stdlib's
+// own parser, which sizes its own reads.
 const int STREAM_READ_SIZE = 16;
-
-// `:message-type` header value marking a frame that carries a service exception
-// rather than an event.
-const string EVENTSTREAM_MSG_TYPE_EXCEPTION = "exception";
 
 // The whole `chatStream()` implementation, shared by every vendor facade.
 //
@@ -80,12 +78,19 @@ function runChatStream(string providerName, ApiFamily family, string wireModelId
     // capability check and the dialect it implies are one lookup and cannot
     // disagree — including on an opaque ARN, whose codec `selectCodec` resolves
     // from `modelSchema` rather than from the (ARN-valued) model id.
+    //
+    // Every codec the module ships now carries a dialect, so this is unreachable
+    // today. It stays because the field is what makes streaming support a property
+    // of the codec: a dialect AWS ships next that this module can encode but not
+    // decode incrementally gets a clean refusal here rather than a silent empty
+    // stream.
     StreamDialect? dialect = codec.streamDialect;
     if dialect is () {
         return error ai:Error(string `Streaming is not supported for model '${wireModelId}' on the ` +
             string `${family} route. Use 'apiFamily = CONVERSE' — ConverseStream is model-agnostic ` +
             string `and streams every vendor.`);
     }
+    StreamWire wire = streamWireFor(family);
 
     ai:ChatMessage[] msgs;
     if messages is ai:ChatUserMessage {
@@ -108,9 +113,11 @@ function runChatStream(string providerName, ApiFamily family, string wireModelId
         span.addTools(tools);
     }
 
-    // The request body is IDENTICAL to the non-streaming call — Bedrock selects
-    // streaming by operation (`converse-stream`, `invoke-with-response-stream`),
-    // never by a body flag — so the codec's encoder is reused verbatim.
+    // The encoder is reused verbatim — a streaming request differs from a buffered
+    // one only in how the route ASKS for the stream, never in what it asks for. On
+    // `bedrock-runtime` that is a different operation and the body is byte-identical;
+    // on Mantle it is `"stream": true` (plus `stream_options` where the dialect hides
+    // usage behind it), which the codec carries as `streamFields`.
     [ai:ChatSystemMessage?, ai:ChatMessage[]] [system, rest] = hoistSystem(msgs);
     RequestCodec encode = codec.encode;
     json|ai:Error encoded = encode(system, rest, tools, stop, params);
@@ -118,19 +125,23 @@ function runChatStream(string providerName, ApiFamily family, string wireModelId
         span.close(encoded);
         return encoded;
     }
+    json|ai:Error body = withStreamFields(encoded, codec.streamFields);
+    if body is ai:Error {
+        span.close(body);
+        return body;
+    }
 
-    [http:Response, map<string>]|ai:Error opened = transport.executeStreaming(encoded, extraHeaders);
+    [http:Response, map<string>]|ai:Error opened = transport.executeStreaming(body, extraHeaders, wire == SSE);
     if opened is ai:Error {
         span.close(opened);
         return opened;
     }
     [http:Response, map<string>] [response, responseHeaders] = opened;
 
-    stream<byte[], io:Error?>|http:ClientError bytes = response.getByteStream(STREAM_READ_SIZE);
-    if bytes is http:ClientError {
-        ai:Error err = error ai:LlmConnectionError("Failed to open the Bedrock response byte stream", bytes);
-        span.close(err);
-        return err;
+    StreamEventSource|ai:Error events = openEventSource(response, wire, family == INVOKE);
+    if events is ai:Error {
+        span.close(events);
+        return events;
     }
 
     string? responseId = responseHeaders[REQUEST_ID_HEADER];
@@ -141,22 +152,79 @@ function runChatStream(string providerName, ApiFamily family, string wireModelId
     // cannot infer the stream's type parameters when the function returns a UNION
     // (`stream<...>|ai:Error`).
     stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
-            bytes, newStreamDecoder(dialect), family == INVOKE, responseId, wireModelId, span));
+            events, newStreamDecoder(dialect), responseId, wireModelId, span));
     return chunks;
 }
 
-# Turns the raw response bytes into normalized chunks: frame, unwrap, decode.
+// Adds the body fields that turn this route's request into a streaming one.
+//
+// A no-op on `bedrock-runtime`, where streaming is a different OPERATION and the
+// body is untouched — which is why the field is optional rather than an empty map
+// everywhere.
+isolated function withStreamFields(json encoded, map<json>? streamFields) returns json|ai:Error {
+    if streamFields is () {
+        return encoded;
+    }
+    if encoded !is map<json> {
+        // Unreachable with the shipped codecs — every Mantle encoder builds an
+        // object — but a codec that returned an array could not carry `"stream"`,
+        // and silently sending a NON-streaming request would hang the caller on a
+        // stream that yields one buffered answer at the very end.
+        return error ai:LlmInvalidGenerationError(
+            "This route's request body is not a JSON object, so it cannot carry the streaming flag");
+    }
+    map<json> body = encoded;
+    foreach [string, json] [k, v] in streamFields.entries() {
+        body[k] = v;
+    }
+    return body;
+}
+
+// Opens the right reader for the route's wire format.
+//
+// The SSE branch hands the body to the stdlib parser; the event-stream branch reads
+// raw bytes, because `getSseEventStream()` hard-validates the content type against
+// `text/event-stream` and `bedrock-runtime` answers
+// `application/vnd.amazon.eventstream` (see stream_eventstream.bal).
+isolated function openEventSource(http:Response response, StreamWire wire, boolean unwrapBytes)
+        returns StreamEventSource|ai:Error {
+    if wire == SSE {
+        stream<http:SseEvent, error?>|http:ClientError events = response.getSseEventStream();
+        if events is http:ClientError {
+            // The stdlib reader validates the content type, so this is also what a
+            // Mantle response that is NOT a stream looks like — the request reached
+            // the model but never asked for one. Naming that cause matters: the only
+            // way to get here is a codec (or a `routeOverrides` entry) whose
+            // `streamFields` did not carry the flag, and the raw binding error says
+            // nothing about it.
+            return error ai:LlmConnectionError(
+                "Failed to open the Bedrock SSE event stream: the response was not 'text/event-stream'. " +
+                "The Mantle route asks for a stream with a body flag, so this usually means the request " +
+                "was sent without one.", events);
+        }
+        return new SseEventSource(events);
+    }
+    stream<byte[], io:Error?>|http:ClientError bytes = response.getByteStream(STREAM_READ_SIZE);
+    if bytes is http:ClientError {
+        return error ai:LlmConnectionError("Failed to open the Bedrock response byte stream", bytes);
+    }
+    return new EventStreamEventSource(bytes, unwrapBytes);
+}
+
+# Turns a source of native events into normalized chunks.
+#
+# Wire-format agnostic by construction: framing, the Invoke envelope, in-band
+# service exceptions and truncation all live behind `StreamEventSource`, and the
+# dialect's event model lives behind `StreamChunkDecoder`. What is left here is what
+# is TRUE OF EVERY BEDROCK STREAM — identity backfill, span accounting, latching a
+# failure, and releasing the response.
 #
 # Owns the observe span for the whole response, because a stream outlives the call
 # that created it — `runChatStream` has already returned by the time the first chunk
 # is pulled, so it cannot close the span itself.
 class BedrockChunkIterator {
-    private final stream<byte[], io:Error?> bytes;
-    private final EventStreamFramer framer = new;
+    private final StreamEventSource events;
     private final StreamChunkDecoder decoder;
-    // INVOKE wraps each vendor payload as `{"bytes": "<base64>"}`; Converse frames
-    // carry the event JSON directly.
-    private final boolean unwrapBytes;
     private final string? responseId;
     private final string wireModelId;
     private final observe:ChatSpan span;
@@ -166,17 +234,11 @@ class BedrockChunkIterator {
     private int completionTokens = 0;
     private string finishReason = "";
     private boolean closed = false;
-    // Whether the response byte stream still holds a connection. Set once the body
-    // is drained, so `close()` can skip a stream that is already exhausted: the
-    // entity is fully read and the connection back in the pool by then, and closing
-    // it anyway risks a spurious "already closed" error out of `close()`.
-    private boolean bytesReleased = false;
 
-    isolated function init(stream<byte[], io:Error?> bytes, StreamChunkDecoder decoder, boolean unwrapBytes,
+    isolated function init(StreamEventSource events, StreamChunkDecoder decoder,
             string? responseId, string wireModelId, observe:ChatSpan span) {
-        self.bytes = bytes;
+        self.events = events;
         self.decoder = decoder;
-        self.unwrapBytes = unwrapBytes;
         self.responseId = responseId;
         self.wireModelId = wireModelId;
         self.span = span;
@@ -192,75 +254,35 @@ class BedrockChunkIterator {
             return ();
         }
         while true {
-            EventStreamFrame|ai:Error? frame = self.framer.nextFrame();
-            if frame is ai:Error {
-                return self.failWith(frame);
+            StreamEvent|ai:Error? event = self.events.next();
+            if event is ai:Error {
+                return self.failWith(event);
             }
-            if frame is EventStreamFrame {
-                ai:ChatCompletionChunk|ai:Error? chunk = self.mapFrame(frame);
-                if chunk is ai:Error {
-                    return self.failWith(chunk);
-                }
-                if chunk is ai:ChatCompletionChunk {
-                    self.recordForSpan(chunk);
-                    return {value: chunk};
-                }
-                // An event with nothing to surface (contentBlockStop, ping, an event
-                // type AWS added later). Pull the next frame rather than emitting an
-                // empty chunk a caller would have to filter out.
-                continue;
-            }
-
-            // No complete frame buffered — read more bytes.
-            record {|byte[] value;|}|io:Error? next = self.bytes.next();
-            if next is io:Error {
-                return self.failWith(error ai:LlmConnectionError("Bedrock stream failed mid-response", next));
-            }
-            if next is () {
-                self.bytesReleased = true;
-                // End of body. A leftover partial frame means the response was cut
-                // short; reporting it beats presenting a truncated answer as complete.
-                if self.framer.hasPartialFrame() {
-                    return self.failWith(error ai:LlmInvalidResponseError(
-                        "Bedrock stream ended mid-frame; the response was truncated"));
-                }
+            if event is () {
                 self.finish();
                 return ();
             }
-            self.framer.feed(next.value);
+            ai:ChatCompletionChunk|ai:Error? chunk = self.decoder.decode(event.eventType, event.payload);
+            if chunk is ai:Error {
+                return self.failWith(chunk);
+            }
+            if chunk is () {
+                // An event with nothing to surface (contentBlockStop, ping, an event
+                // type the vendor added later). Pull the next one rather than
+                // emitting an empty chunk a caller would have to filter out.
+                continue;
+            }
+            ai:ChatCompletionChunk out = self.withIdentity(chunk);
+            self.recordForSpan(out);
+            return {value: out};
         }
     }
 
-    // One frame -> at most one chunk.
-    private isolated function mapFrame(EventStreamFrame frame) returns ai:ChatCompletionChunk|ai:Error? {
-        // A service exception arrives as a FRAME, not an HTTP status: the response
-        // was a clean 200 and the failure (throttling, a model error, a filtered
-        // completion) happened partway through generating. Surfacing it as an error
-        // is what stops a caller reading a half-answer as a whole one.
-        if frame.headers[HDR_MESSAGE_TYPE] == EVENTSTREAM_MSG_TYPE_EXCEPTION {
-            string kind = frame.headers[HDR_EXCEPTION_TYPE] ?: "unknown";
-            json|ai:Error body = framePayloadAsJson(frame);
-            string detail = "";
-            if body is map<json> {
-                detail = strField(body, "message") ?: strField(body, "Message") ?: "";
-            }
-            return error ai:LlmError(string `Bedrock stream ${kind}` + (detail == "" ? "" : string `: ${detail}`));
-        }
-
-        json payload = check framePayloadAsJson(frame);
-        string eventType = frame.headers[HDR_EVENT_TYPE] ?: "";
-        if self.unwrapBytes {
-            payload = check unwrapInvokeChunk(payload);
-            [eventType, payload] = unwrapNamedEvent(eventType, payload);
-        }
-        ai:ChatCompletionChunk? chunk = check self.decoder.decode(eventType, payload);
-        if chunk is () {
-            return ();
-        }
-
-        // Identity, filled in where the dialect did not supply it. Converse events
-        // carry neither: the request id from the response header is the only value
-        // stable across every chunk, which is what the contract asks `id` to be.
+    // Fills in the identity the dialect did not supply. Converse events carry
+    // neither id nor model: the request id from the response header is the only
+    // value stable across every chunk of a response, which is what the contract
+    // asks `id` to be. The OpenAI-shaped dialects carry both and keep them.
+    private isolated function withIdentity(ai:ChatCompletionChunk chunk) returns ai:ChatCompletionChunk {
         ai:ChatCompletionChunk out = chunk;
         if out.id is () {
             string? id = self.responseId;
@@ -328,95 +350,11 @@ class BedrockChunkIterator {
     // span dangles unclosed.
     //
     // Idempotent on both halves: the span close guards on `closed` (and is already a
-    // no-op after a failure), and the byte stream is skipped once drained or closed.
+    // no-op after a failure), and the event source skips a body it already released.
     public isolated function close() returns ai:Error? {
         self.finish();
-        if self.bytesReleased {
-            return ();
-        }
-        self.bytesReleased = true;
-        io:Error? err = self.bytes.close();
-        if err is io:Error {
-            return error ai:LlmConnectionError("Failed to close the Bedrock response byte stream", err);
-        }
-        return ();
+        return self.events.close();
     }
-}
-
-// Re-derives the event type for a dialect that names its event in the PAYLOAD
-// rather than in the frame header.
-//
-// FOUND LIVE, 2026-08-24, Nova Pro on `InvokeModelWithResponseStream`: the stream
-// completed cleanly and produced ZERO chunks — no error, no text. On the Invoke
-// route every frame's `:event-type` header is the constant `chunk`, so the event
-// name has to come from somewhere else, and Nova puts it in the single top-level
-// KEY of the payload:
-//
-//     ConverseStream (header):  :event-type: contentBlockDelta
-//                               {"contentBlockIndex":0,"delta":{"text":"hi"}}
-//
-//     Nova on Invoke (key):     :event-type: chunk
-//                               {"contentBlockDelta":{"contentBlockIndex":0,
-//                                                     "delta":{"text":"hi"}}}
-//
-// The decoder matched `chunk` against its event names, found nothing, and skipped
-// every frame — a silent empty stream, which is the worst possible failure shape.
-//
-// Anthropic-on-Invoke is untouched: its payload keys are `type`/`index`/`delta`/
-// `message`/`usage`/`content_block`, none of which collide with a Converse event
-// name, so it falls through to the header and its own decoder reads `type` itself.
-// Falling back to the header keeps ConverseStream working unchanged.
-//
-// The lookup is over EVERY key, not just a single-key payload. Nova's terminal
-// frame is the exception that proves it:
-//
-//     {"metadata": {"usage": {...}, "metrics": {}, "trace": {}},
-//      "amazon-bedrock-invocationMetrics": {...}}
-//
-// Bedrock decorates the last frame with its own invocation metrics, so the payload
-// carries TWO top-level keys. An arity guard drops it, and the usage that rides on
-// `metadata` — the only usage a Converse-shaped stream ever reports — never reaches
-// the caller. The event-name lookup is the discriminator; arity never was.
-isolated function unwrapNamedEvent(string headerEventType, json payload) returns [string, json] {
-    if payload is map<json> {
-        foreach [string, json] [name, inner] in payload.entries() {
-            if isConverseEventName(name) {
-                return [name, inner];
-            }
-        }
-    }
-    return [headerEventType, payload];
-}
-
-// Whether a name is one of the `ConverseStream` event types.
-isolated function isConverseEventName(string name) returns boolean =>
-    name == CONVERSE_EVT_MESSAGE_START || name == CONVERSE_EVT_CONTENT_BLOCK_START ||
-    name == CONVERSE_EVT_CONTENT_BLOCK_DELTA || name == CONVERSE_EVT_CONTENT_BLOCK_STOP ||
-    name == CONVERSE_EVT_MESSAGE_STOP || name == CONVERSE_EVT_METADATA;
-
-// Unwraps an InvokeModelWithResponseStream frame body.
-//
-// Every frame on the Invoke route is `:event-type: chunk` with a payload of
-// `{"bytes": "<base64>"}`, whose decoded content is the VENDOR's own event JSON.
-// Converse has no such wrapper — the frame body is the event.
-isolated function unwrapInvokeChunk(json payload) returns json|ai:Error {
-    if payload !is map<json> {
-        return error ai:LlmInvalidResponseError("Bedrock Invoke stream frame was not a JSON object");
-    }
-    string? encoded = strField(payload, "bytes");
-    if encoded is () {
-        return error ai:LlmInvalidResponseError("Bedrock Invoke stream frame carried no 'bytes' member");
-    }
-    byte[]|error decoded = array:fromBase64(encoded);
-    if decoded is error {
-        return error ai:LlmInvalidResponseError("Bedrock Invoke stream frame 'bytes' was not valid base64", decoded);
-    }
-    string text = check bytesToString(decoded);
-    json|error parsed = text.fromJsonString();
-    if parsed is error {
-        return error ai:LlmInvalidResponseError("Bedrock Invoke stream frame payload was not valid JSON", parsed);
-    }
-    return parsed;
 }
 
 // Builds the string stream behind the dependently-typed `generateStream`.
@@ -446,7 +384,7 @@ function generateLlmResponseStream(ai:ModelProvider llmModel, ai:Prompt prompt, 
 }
 
 # Projects a chunk stream onto its text fragments, skipping the chunks that carry
-# no content — role-only openers, tool-call fragments, usage-only closers.
+# no content — role-only openers, reasoning, tool-call fragments, usage-only closers.
 class ChunkTextIterator {
     private final stream<ai:ChatCompletionChunk, ai:Error?> chunks;
 

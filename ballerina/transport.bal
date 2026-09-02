@@ -126,20 +126,38 @@ isolated client class BedrockTransport {
     // a 2xx is in hand the response is returned live, and a failure after that
     // cannot be retried: chunks have already been delivered to the caller, and
     // re-sending would duplicate the answer rather than resume it.
-    isolated function executeStreaming(json body, map<string> extraHeaders = {})
+    //
+    // + sse - Whether the route answers `text/event-stream` (Mantle) rather than
+    //         AWS's binary event-stream. Adds the matching `Accept`, which is
+    //         SIGNED like every other header we send
+    isolated function executeStreaming(json body, map<string> extraHeaders = {}, boolean sse = false)
             returns [http:Response, map<string>]|ai:Error {
         string? path = self.streamPath;
         if path is () {
-            // Mantle today. Reached only if a codec carries a `streamDialect`
-            // without a stream path being built for its route — a wiring bug.
+            // Reached only if a codec carries a `streamDialect` without a stream
+            // path being built for its route — a wiring bug.
             return error ai:Error("This Bedrock route has no streaming endpoint");
+        }
+        map<string> headers = extraHeaders;
+        if sse {
+            // Copied entry by entry, NOT with `clone()`: the facades pass a
+            // `readonly &` header map, and cloning an immutable value hands back the
+            // same immutable value — so the `Accept` insertion panicked with
+            // "modification not allowed on readonly value" on the first Mantle
+            // stream.
+            map<string> withAccept = {};
+            foreach [string, string] [name, value] in extraHeaders.entries() {
+                withAccept[name] = value;
+            }
+            withAccept[ACCEPT_HEADER] = TEXT_EVENT_STREAM;
+            headers = withAccept;
         }
         RetryConfig rc = self.retryConfig;
         int attempt = 0;
         decimal delay = rc.initialDelay;
         while true {
             [http:Response, map<string>]|RetryableError|ai:Error result =
-                self.executeStreamingOnce(path, body, extraHeaders);
+                self.executeStreamingOnce(path, body, headers);
             if result is [http:Response, map<string>] {
                 return result;
             }
@@ -392,6 +410,13 @@ type TransportResponse record {|
 
 // Response-header keys captured into `TransportResponse.headers` (design §9.5).
 const REQUEST_ID_HEADER = "requestId";
+
+// Sent on a Mantle streaming request. The vendor APIs answer SSE either way, but
+// `http:Response.getSseEventStream()` refuses anything that is not
+// `text/event-stream`, so asking for it explicitly is what keeps a proxy or a future
+// content negotiation from turning a good stream into a binding error.
+const ACCEPT_HEADER = "Accept";
+const TEXT_EVENT_STREAM = "text/event-stream";
 
 // A retryable transport outcome (408/429/500/502/503/504 or a connection failure — §9.5).
 // A `distinct error` so it narrows cleanly against `json` and `ai:Error`.

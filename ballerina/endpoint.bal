@@ -33,8 +33,9 @@ type Endpoint record {|
     # A separate member rather than surgery on `path` at call time: the model-id
     # segment is single-encoded exactly once, here, and deriving the stream path by
     # string-replacing a suffix on an already-encoded path would put that invariant
-    # in two places. Mantle has no entry — its streaming surface is SSE on the same
-    # path with `"stream": true` in the body, which is not yet implemented.
+    # in two places. On Mantle it is EQUAL to `path` — that route streams from the
+    # same URL, switched on by a body field — and the member stays optional so a
+    # future route with no streaming surface at all can say so.
     string? streamPath = ();
     # SigV4 signing name for this route.
     string signingService;
@@ -56,9 +57,13 @@ isolated function buildEndpoint(Route route) returns Endpoint|error {
             host: string `bedrock-mantle.${route.region}.api.aws`,
             path: entry.path,
             // Mantle streams as SSE on the SAME path, switched on by a `"stream":
-            // true` body field rather than a different endpoint — so there is no
-            // second path to record. Left unset until that dialect is implemented.
-            streamPath: (),
+            // true` body field (carried by the codec's `streamFields`) rather than
+            // by a different endpoint — so the stream path IS the path. The two
+            // members are kept distinct anyway: `runChatStream` posts to
+            // `streamPath` on every route, and collapsing them here is what keeps
+            // that one call site free of a Mantle special case.
+            // https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html
+            streamPath: entry.path,
             signingService: SIGNING_BEDROCK_MANTLE
         };
     }

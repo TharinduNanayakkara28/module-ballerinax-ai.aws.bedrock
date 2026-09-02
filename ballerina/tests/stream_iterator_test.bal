@@ -14,6 +14,7 @@
 
 import ballerina/ai;
 import ballerina/ai.observe;
+import ballerina/http;
 import ballerina/io;
 import ballerina/lang.array;
 import ballerina/test;
@@ -97,8 +98,9 @@ type DrainResult record {|
 function drainChunks(byte[] wire, StreamDialect dialect, boolean unwrapBytes, int readSize = 1)
         returns DrainResult {
     stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, readSize));
-    BedrockChunkIterator iterator = new (bytes, newStreamDecoder(dialect), unwrapBytes,
-            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0"));
+    BedrockChunkIterator iterator = new (new EventStreamEventSource(bytes, unwrapBytes),
+            newStreamDecoder(dialect), "req-abc", "test.model-v1:0",
+            observe:createChatSpan("test.model-v1:0"));
     ai:ChatCompletionChunk[] chunks = [];
     while true {
         record {|ai:ChatCompletionChunk value;|}|ai:Error? next = iterator.next();
@@ -317,17 +319,40 @@ function testStreamPipelineRejectsAnInvokeFrameWithoutBytes() {
 // ---------------------------------------------------------------------------
 
 @test:Config {}
-function testChatStreamIsRefusedOnAMantleRoutedModel() {
-    // Mantle streams as SSE with a body flag — a different transport entirely, and
-    // not yet implemented. The refusal must happen BEFORE any I/O and must name the
-    // escape hatch, exactly as the module's other capability guards do.
-    AnthropicModelProvider mantle = checkpanic new (TEST_CREDS, CLAUDE_SONNET_5, REGION);
-    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result = mantle->chatStream({role: ai:USER, content: "Hi"});
-    if result !is ai:Error {
-        test:assertFail("chatStream on an AUTO (Mantle) route must be refused");
-    }
-    test:assertTrue(result.message().includes("Streaming is not supported"), result.message());
-    test:assertTrue(result.message().includes("apiFamily = CONVERSE"), result.message());
+function testAMantleRoutedModelResolvesAStreamingRouteWithoutABodyRewrite() returns error? {
+    // Mantle used to be refused before any I/O — it streams as SSE from the same path
+    // with a body flag, which was a different transport than the one that shipped.
+    // Now it resolves like any other route, and the three things that make it work
+    // are pinned here because each is invisible at the call site.
+    //
+    // `claude-sonnet-5` is the case that matters: it is dual-homed, so AUTO sends the
+    // module's flagship Claude to Mantle, and every one of those callers used to lose
+    // streaming.
+    Route route = check resolveRoute(CLAUDE_SONNET_5, REGION);
+    test:assertEquals(route.family, MANTLE, "a Mantle-capable bare id prefers Mantle under AUTO");
+
+    readonly & ModelCodec codec = check selectCodec(route);
+    test:assertEquals(codec.streamDialect, ANTHROPIC_STREAM, "Mantle Messages reuses Anthropic's events");
+    test:assertEquals(codec.streamFields, {"stream": true}, "Mantle asks for the stream in the BODY");
+
+    Endpoint ep = check buildEndpoint(route);
+    test:assertEquals(ep.streamPath, ep.path, "and streams from the SAME path, not a sibling operation");
+    test:assertEquals(streamWireFor(route.family), SSE, "so the response is SSE, not event-stream framed");
+}
+
+@test:Config {}
+function testTheStreamingGuardStillRefusesACodecWithoutADialect() {
+    // Every shipped codec streams, so the guard in `runChatStream` is unreachable
+    // today — but it is what keeps a future codec that this module can encode and
+    // cannot decode incrementally from returning a silent, empty stream instead of an
+    // error. Pinned at the field, since no route can exercise it any more.
+    readonly & ModelCodec unstreamable = {
+        encode: encodeConverse,
+        decode: decodeConverse,
+        toolChoice: CONVERSE_TOOL_CHOICE,
+        streamDialect: ()
+    };
+    test:assertTrue(unstreamable.streamDialect is (), "the guard reads exactly this");
 }
 
 @test:Config {}
@@ -360,8 +385,8 @@ function testClosingAPartiallyReadStreamReleasesTheResponseBody() returns error?
     FakeByteStream body = new (wire, 1);
     stream<byte[], io:Error?> bytes = new (body);
     stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
-            bytes, newStreamDecoder(CONVERSE_STREAM), false, "req-abc", "test.model-v1:0",
-            observe:createChatSpan("test.model-v1:0")));
+            new EventStreamEventSource(bytes, false), newStreamDecoder(CONVERSE_STREAM),
+            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0")));
 
     record {|ai:ChatCompletionChunk value;|}? first = check chunks.next();
     test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "the first chunk must arrive");
@@ -380,8 +405,8 @@ function testClosingAnExhaustedStreamIsANoOp() returns error? {
     FakeByteStream body = new (wire, 1);
     stream<byte[], io:Error?> bytes = new (body);
     stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
-            bytes, newStreamDecoder(CONVERSE_STREAM), false, "req-abc", "test.model-v1:0",
-            observe:createChatSpan("test.model-v1:0")));
+            new EventStreamEventSource(bytes, false), newStreamDecoder(CONVERSE_STREAM),
+            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0")));
 
     _ = check chunks.next(); // messageStop
     test:assertEquals(check chunks.next(), (), "the stream must end after its last frame");
@@ -404,8 +429,8 @@ function testClosingAFailedStreamStillReleasesTheResponseBody() returns error? {
     FakeByteStream body = new (wire, 1);
     stream<byte[], io:Error?> bytes = new (body);
     stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
-            bytes, newStreamDecoder(CONVERSE_STREAM), false, "req-abc", "test.model-v1:0",
-            observe:createChatSpan("test.model-v1:0")));
+            new EventStreamEventSource(bytes, false), newStreamDecoder(CONVERSE_STREAM),
+            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0")));
 
     record {|ai:ChatCompletionChunk value;|}|ai:Error? first = chunks.next();
     test:assertTrue(first is ai:Error, "an exception frame must surface as an error");
@@ -447,8 +472,9 @@ function testAFailedStreamStaysEnded() {
     wire.push(...converseFrame("messageStop", "{\"stopReason\":\"end_turn\"}"));
 
     stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, 1));
-    BedrockChunkIterator iterator = new (bytes, newStreamDecoder(CONVERSE_STREAM), false,
-            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0"));
+    BedrockChunkIterator iterator = new (new EventStreamEventSource(bytes, false),
+            newStreamDecoder(CONVERSE_STREAM), "req-abc", "test.model-v1:0",
+            observe:createChatSpan("test.model-v1:0"));
 
     record {|ai:ChatCompletionChunk value;|}|ai:Error? first = iterator.next();
     test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "the text before the exception arrives");
@@ -466,10 +492,227 @@ function testAClosedStreamStopsYielding() returns error? {
     wire.push(...converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"b\"}}"));
 
     stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, 1));
-    BedrockChunkIterator iterator = new (bytes, newStreamDecoder(CONVERSE_STREAM), false,
-            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0"));
+    BedrockChunkIterator iterator = new (new EventStreamEventSource(bytes, false),
+            newStreamDecoder(CONVERSE_STREAM), "req-abc", "test.model-v1:0",
+            observe:createChatSpan("test.model-v1:0"));
 
     test:assertTrue(iterator.next() is record {|ai:ChatCompletionChunk value;|}, "the first chunk arrives");
     check iterator.close();
     test:assertTrue(iterator.next() is (), "a closed stream must not resume");
+}
+
+// ---------------------------------------------------------------------------
+// Mantle, end to end: SSE frames -> chunks
+// ---------------------------------------------------------------------------
+
+# Replays a canned SSE event sequence, recording whether the body was released.
+#
+# The Mantle counterpart of `FakeByteStream`: the stdlib SSE reader hands back
+# already-parsed `http:SseEvent` values, so what needs exercising here is the adaptation
+# onto `StreamEventSource` — the sentinel, the keep-alives, the error frame and the
+# release — not a line parser this module does not own.
+class FakeSseStream {
+    private final http:SseEvent[] events;
+    private int pos = 0;
+    private int closeCount = 0;
+
+    isolated function init(http:SseEvent[] events) {
+        self.events = events;
+    }
+
+    public isolated function next() returns record {|http:SseEvent value;|}|error? {
+        if self.pos >= self.events.length() {
+            return ();
+        }
+        http:SseEvent event = self.events[self.pos];
+        self.pos += 1;
+        return {value: event};
+    }
+
+    public isolated function close() returns error? {
+        self.closeCount += 1;
+        return ();
+    }
+
+    isolated function closes() returns int => self.closeCount;
+}
+
+// Drains a canned SSE response through the whole pipeline.
+function drainSse(http:SseEvent[] events, StreamDialect dialect) returns DrainResult {
+    stream<http:SseEvent, error?> sse = new (new FakeSseStream(events));
+    BedrockChunkIterator iterator = new (new SseEventSource(sse), newStreamDecoder(dialect),
+            "req-mantle", "anthropic.claude-sonnet-5", observe:createChatSpan("anthropic.claude-sonnet-5"));
+    ai:ChatCompletionChunk[] chunks = [];
+    while true {
+        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = iterator.next();
+        if next is () {
+            return {chunks, err: ()};
+        }
+        if next is ai:Error {
+            return {chunks, err: next};
+        }
+        chunks.push(next.value);
+    }
+}
+
+@test:Config {}
+function testMantleMessagesSsePipelineDecodesWithTheAnthropicDecoder() {
+    // The reuse that makes Mantle Messages nearly free: these are the SAME events
+    // `InvokeModelWithResponseStream` delivers, so the existing decoder reads them
+    // once the SSE framing is stripped.
+    DrainResult result = drainSse([
+        {event: "message_start", data: "{\"type\":\"message_start\",\"message\":" +
+                "{\"id\":\"msg_1\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":9}}}"},
+        {event: "content_block_delta",
+            data: "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi \"}}"},
+        {event: "content_block_delta",
+            data: "{\"type\":\"content_block_delta\",\"index\":0," +
+                    "\"delta\":{\"type\":\"text_delta\",\"text\":\"there\"}}"},
+        {event: "message_delta",
+            data: "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}," +
+                    "\"usage\":{\"output_tokens\":4}}"},
+        {event: "message_stop", data: "{\"type\":\"message_stop\"}"}
+    ], ANTHROPIC_STREAM);
+
+    test:assertTrue(result.err is (), "a well-formed SSE response must end cleanly");
+    test:assertEquals(textOf(result.chunks), "Hi there");
+    ai:ChatCompletionChunk last = result.chunks[result.chunks.length() - 1];
+    test:assertEquals(last.choices[0].finishReason, ai:STOP);
+    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>last?.usage;
+    test:assertEquals(usage.promptTokens, 9, "the prompt half is stashed from message_start");
+    test:assertEquals(usage.completionTokens, 4);
+}
+
+@test:Config {}
+function testMantleChatSsePipelineStopsAtTheDoneSentinel() {
+    // `[DONE]` is not JSON. Parsing it would report a malformed event on a response
+    // that in fact completed perfectly.
+    FakeSseStream body = new ([
+        {data: "{\"id\":\"chatcmpl-1\",\"model\":\"zai.glm-5\"," +
+                "\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"},
+        {data: "{\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}"},
+        {data: "[DONE]"}
+    ]);
+    stream<http:SseEvent, error?> sse = new (body);
+    BedrockChunkIterator iterator = new (new SseEventSource(sse), newStreamDecoder(OPENAI_CHAT_STREAM),
+            "req-mantle", "zai.glm-5", observe:createChatSpan("zai.glm-5"));
+
+    ai:ChatCompletionChunk[] chunks = [];
+    while true {
+        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = iterator.next();
+        if next is () {
+            break;
+        }
+        if next is ai:Error {
+            test:assertFail(next.message());
+        }
+        chunks.push(next.value);
+    }
+    test:assertEquals(textOf(chunks), "ok");
+    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunks[chunks.length() - 1]?.usage;
+    test:assertEquals(usage.totalTokens, 6);
+    // The sentinel ends the stream mid-body, so the connection is released there
+    // rather than left for a caller that has no reason to call `close()`.
+    test:assertEquals(body.closes(), 1, "[DONE] must release the response");
+}
+
+@test:Config {}
+function testMantleResponsesSsePipelineDecodesTheLifecycle() {
+    DrainResult result = drainSse([
+        {event: RESPONSES_EVT_CREATED,
+            data: "{\"type\":\"response.created\",\"response\":{\"id\":\"resp_9\",\"model\":\"openai.gpt-5.5\"}}"},
+        {event: RESPONSES_EVT_OUTPUT_TEXT_DELTA,
+            data: "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Once \"}"},
+        {event: RESPONSES_EVT_OUTPUT_TEXT_DELTA,
+            data: "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"upon\"}"},
+        {event: RESPONSES_EVT_COMPLETED,
+            data: "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"," +
+                    "\"usage\":{\"input_tokens\":8,\"output_tokens\":2,\"total_tokens\":10}}}"}
+    ], RESPONSES_STREAM);
+
+    test:assertTrue(result.err is ());
+    test:assertEquals(textOf(result.chunks), "Once upon");
+    test:assertEquals(result.chunks[0].id, "resp_9", "the dialect's own id survives the backfill");
+    ai:ChatCompletionChunk last = result.chunks[result.chunks.length() - 1];
+    test:assertEquals(last.choices[0].finishReason, ai:STOP);
+    test:assertEquals((<ai:CompletionTokenUsage>last?.usage).totalTokens, 10);
+}
+
+@test:Config {}
+function testSseKeepAlivesAndCommentsAreSkipped() {
+    // Mantle sends comment lines to hold the connection open while the model thinks.
+    // Surfacing them would hand a caller empty chunks to filter out.
+    DrainResult result = drainSse([
+        {comment: "keep-alive"},
+        {event: "ping", data: "{\"type\":\"ping\"}"},
+        {data: "   "},
+        {event: "content_block_delta",
+            data: "{\"type\":\"content_block_delta\",\"index\":0," +
+                    "\"delta\":{\"type\":\"text_delta\",\"text\":\"finally\"}}"}
+    ], ANTHROPIC_STREAM);
+
+    test:assertTrue(result.err is ());
+    test:assertEquals(result.chunks.length(), 1, "only the one event with content reaches the caller");
+    test:assertEquals(textOf(result.chunks), "finally");
+}
+
+@test:Config {}
+function testSseErrorEventSurfacesAsAnError() {
+    // Mantle's equivalent of the event-stream exception frame: a clean 200, then a
+    // failure partway through generating. Ending quietly would present a half answer
+    // as a whole one.
+    DrainResult result = drainSse([
+        {event: "content_block_delta",
+            data: "{\"type\":\"content_block_delta\",\"index\":0," +
+                    "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}"},
+        {event: "error", data: "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"," +
+                "\"message\":\"Server overloaded\"}}"},
+        {event: "content_block_delta",
+            data: "{\"type\":\"content_block_delta\",\"index\":0," +
+                    "\"delta\":{\"type\":\"text_delta\",\"text\":\" more\"}}"}
+    ], ANTHROPIC_STREAM);
+
+    test:assertEquals(textOf(result.chunks), "partial", "the text before the failure is delivered");
+    ai:Error? err = result.err;
+    if err is () {
+        test:assertFail("an SSE error event must end the stream with an error");
+    }
+    test:assertTrue(err.message().includes("Server overloaded"), err.message());
+}
+
+@test:Config {}
+function testSseMalformedDataIsReported() {
+    DrainResult result = drainSse([{event: "message_delta", data: "{not json"}], ANTHROPIC_STREAM);
+    ai:Error? err = result.err;
+    if err is () {
+        test:assertFail("unparseable SSE data must not pass as a clean end of stream");
+    }
+    test:assertTrue(err.message().includes("not valid JSON"), err.message());
+}
+
+@test:Config {}
+function testClosingAPartiallyReadSseStreamReleasesTheResponse() returns error? {
+    // The same leak as on the event-stream wire: a caller that breaks out early has
+    // only `close()`, and without the propagation the SSE body stays open.
+    FakeSseStream body = new ([
+        {event: "content_block_delta",
+            data: "{\"type\":\"content_block_delta\",\"index\":0," +
+                    "\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}"},
+        {event: "content_block_delta",
+            data: "{\"type\":\"content_block_delta\",\"index\":0," +
+                    "\"delta\":{\"type\":\"text_delta\",\"text\":\"b\"}}"}
+    ]);
+    stream<http:SseEvent, error?> sse = new (body);
+    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+            new SseEventSource(sse), newStreamDecoder(ANTHROPIC_STREAM), "req-mantle",
+            "anthropic.claude-sonnet-5", observe:createChatSpan("anthropic.claude-sonnet-5")));
+
+    record {|ai:ChatCompletionChunk value;|}? first = check chunks.next();
+    test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "the first chunk must arrive");
+    test:assertEquals(body.closes(), 0, "reading must not close the body");
+
+    check chunks.close();
+    test:assertEquals(body.closes(), 1, "close() must reach the SSE stream");
+    check chunks.close();
+    test:assertEquals(body.closes(), 1, "close() must stay idempotent");
 }

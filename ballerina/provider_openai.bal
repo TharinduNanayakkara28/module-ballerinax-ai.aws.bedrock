@@ -126,9 +126,15 @@ public isolated distinct client class OpenAIModelProvider {
 
     # Sends a chat request and streams the reply as normalized chunks.
     #
-    # Supported on the Converse route for every vendor (`ConverseStream` is
-    # model-agnostic) and on the Invoke route for Claude and Nova. Any other route
-    # returns an `ai:Error` naming `apiFamily = CONVERSE` as the remedy.
+    # Supported on EVERY route this module resolves — the wire differs, the contract
+    # does not: `ConverseStream` on Converse, `InvokeModelWithResponseStream` on
+    # Invoke (both AWS event-stream framed), and SSE on Mantle, where the stream is
+    # asked for with a body flag on the same path.
+    #
+    # Streaming on `bedrock-runtime` needs the SEPARATE
+    # `bedrock:InvokeModelWithResponseStream` IAM action — `ConverseStream` included —
+    # so a role that can `chat()` may still be denied here. On Mantle the usual
+    # `bedrock-mantle:CreateInference` covers it.
     #
     # NOT `isolated`, unlike `chat`: the returned stream is backed by an iterator
     # carrying mutable framing state. `ai:ModelProvider` does not declare it

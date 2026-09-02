@@ -243,4 +243,14 @@ type ModelCodec record {|
     # unrepresentable: `selectCodec` already resolves an ARN's dialect from
     # `modelSchema`, and whatever it picks carries its own answer.
     StreamDialect? streamDialect;
+    # Body fields that turn this route's request into a STREAMING request, merged
+    # into the encoded body by `runChatStream`. `()` on `bedrock-runtime`, where
+    # streaming is a separate OPERATION and the body is byte-identical to the
+    # buffered call; `{"stream": true}` (and whatever else the dialect hides usage
+    # behind) on Mantle, which streams from the SAME path.
+    #
+    # On the codec rather than the endpoint because it is a property of the WIRE
+    # DIALECT, not of the URL: all three Mantle codecs post to `bedrock-mantle`, but
+    # only the Chat Completions one has to ask for usage with `stream_options`.
+    map<json>? streamFields = ();
 |};

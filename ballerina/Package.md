@@ -42,16 +42,28 @@ check from string fragment in text
 ```
 
 `chatStream()` gives the same response as normalized `ai:ChatCompletionChunk`s, carrying content,
-reasoning, tool-call fragments, finish reason and usage. Supported on the **Converse** route for every
-vendor, and on Invoke for Claude and Nova; any other route is refused before the network call, naming
-`apiFamily = bedrock:CONVERSE` as the remedy. Only a `string` target streams — use `generate()` for
-typed results.
+reasoning, tool-call fragments, finish reason and usage. Supported on **every route** — Converse,
+Invoke and Mantle — for every vendor. Only a `string` target streams; use `generate()` for typed
+results, which cannot stream (the value comes out of a forced tool call, bindable only once the whole
+JSON has arrived).
+
+The wire differs per route, the contract does not. Converse and Invoke stream AWS's binary
+event-stream from a sibling operation (`converse-stream`, `invoke-with-response-stream`); Mantle
+streams SSE from the same path, asked for with `"stream": true` in the body. Two consequences worth
+knowing: a mid-stream failure arrives **in-band on an HTTP 200** (a throttle, a model error, a
+guardrail trip) and surfaces as an `ai:Error` rather than a short answer that looks complete; and
+retries cover only the handshake — once chunks have been delivered, re-sending would duplicate the
+answer rather than resume it.
+
+Close a stream you stop reading early. Abandoning one without `close()` leaves the response body — and
+its pooled connection — open.
 
 ## Three things that will silently cost you
 
 **Streaming needs the separate `bedrock:InvokeModelWithResponseStream` IAM action.** It is not covered
 by the `bedrock:InvokeModel` that `chat()` uses — `ConverseStream` included — so a role that chats
-fine can be denied on `chatStream()` alone.
+fine can be denied on `chatStream()` alone. Mantle is the exception: `bedrock-mantle:CreateInference`
+authorizes streaming and non-streaming alike.
 
 **Mantle needs the separate `bedrock-mantle:CreateInference` IAM action.** Working `bedrock:InvokeModel`
 permissions are **not** enough — otherwise you get `AccessDenied` with no clue why.

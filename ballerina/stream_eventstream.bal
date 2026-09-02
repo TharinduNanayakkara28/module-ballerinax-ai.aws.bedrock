@@ -13,6 +13,8 @@
 // limitations under the License.
 
 import ballerina/ai;
+import ballerina/io;
+import ballerina/lang.array;
 
 // AWS event-stream (`application/vnd.amazon.eventstream`) frame decoder.
 //
@@ -229,6 +231,179 @@ isolated function framePayloadAsJson(EventStreamFrame frame) returns json|ai:Err
     json|error parsed = text.fromJsonString();
     if parsed is error {
         return error ai:LlmInvalidResponseError("Bedrock event-stream frame payload was not valid JSON", parsed);
+    }
+    return parsed;
+}
+
+// `:message-type` header value marking a frame that carries a service exception
+// rather than an event.
+const string EVENTSTREAM_MSG_TYPE_EXCEPTION = "exception";
+
+# Reads one event-stream response: bytes in, `StreamEvent`s out.
+#
+# Owns everything that is specific to the `bedrock-runtime` wire — framing, the
+# Invoke `{"bytes": …}` envelope, in-band service exceptions, and truncation — so
+# that `BedrockChunkIterator` above it is identical on both endpoints.
+class EventStreamEventSource {
+    *StreamEventSource;
+
+    private final stream<byte[], io:Error?> bytes;
+    private final EventStreamFramer framer = new;
+    // INVOKE wraps each vendor payload as `{"bytes": "<base64>"}`; Converse frames
+    // carry the event JSON directly.
+    private final boolean unwrapBytes;
+    // Whether the response byte stream still holds a connection. Set once the body
+    // is drained, so `close()` can skip a stream that is already exhausted: the
+    // entity is fully read and the connection back in the pool by then, and closing
+    // it anyway risks a spurious "already closed" error out of `close()`.
+    private boolean released = false;
+
+    isolated function init(stream<byte[], io:Error?> bytes, boolean unwrapBytes) {
+        self.bytes = bytes;
+        self.unwrapBytes = unwrapBytes;
+    }
+
+    isolated function next() returns StreamEvent|ai:Error? {
+        while true {
+            EventStreamFrame|ai:Error? frame = self.framer.nextFrame();
+            if frame is ai:Error {
+                return frame;
+            }
+            if frame is EventStreamFrame {
+                return self.mapFrame(frame);
+            }
+
+            // No complete frame buffered — read more bytes.
+            record {|byte[] value;|}|io:Error? next = self.bytes.next();
+            if next is io:Error {
+                return error ai:LlmConnectionError("Bedrock stream failed mid-response", next);
+            }
+            if next is () {
+                self.released = true;
+                // End of body. A leftover partial frame means the response was cut
+                // short; reporting it beats presenting a truncated answer as complete.
+                if self.framer.hasPartialFrame() {
+                    return error ai:LlmInvalidResponseError(
+                        "Bedrock stream ended mid-frame; the response was truncated");
+                }
+                return ();
+            }
+            self.framer.feed(next.value);
+        }
+    }
+
+    isolated function close() returns ai:Error? {
+        if self.released {
+            return ();
+        }
+        self.released = true;
+        io:Error? err = self.bytes.close();
+        if err is io:Error {
+            return error ai:LlmConnectionError("Failed to close the Bedrock response byte stream", err);
+        }
+        return ();
+    }
+
+    // One frame -> one event.
+    private isolated function mapFrame(EventStreamFrame frame) returns StreamEvent|ai:Error {
+        // A service exception arrives as a FRAME, not an HTTP status: the response
+        // was a clean 200 and the failure (throttling, a model error, a filtered
+        // completion) happened partway through generating. Surfacing it as an error
+        // is what stops a caller reading a half-answer as a whole one.
+        if frame.headers[HDR_MESSAGE_TYPE] == EVENTSTREAM_MSG_TYPE_EXCEPTION {
+            string kind = frame.headers[HDR_EXCEPTION_TYPE] ?: "unknown";
+            json|ai:Error body = framePayloadAsJson(frame);
+            string detail = "";
+            if body is map<json> {
+                detail = strField(body, "message") ?: strField(body, "Message") ?: "";
+            }
+            return error ai:LlmError(string `Bedrock stream ${kind}` + (detail == "" ? "" : string `: ${detail}`));
+        }
+
+        json payload = check framePayloadAsJson(frame);
+        string eventType = frame.headers[HDR_EVENT_TYPE] ?: "";
+        if self.unwrapBytes {
+            payload = check unwrapInvokeChunk(payload);
+            [eventType, payload] = unwrapNamedEvent(eventType, payload);
+        }
+        return {eventType, payload};
+    }
+}
+
+// Re-derives the event type for a dialect that names its event in the PAYLOAD
+// rather than in the frame header.
+//
+// FOUND LIVE, 2026-08-24, Nova Pro on `InvokeModelWithResponseStream`: the stream
+// completed cleanly and produced ZERO chunks — no error, no text. On the Invoke
+// route every frame's `:event-type` header is the constant `chunk`, so the event
+// name has to come from somewhere else, and Nova puts it in the single top-level
+// KEY of the payload:
+//
+//     ConverseStream (header):  :event-type: contentBlockDelta
+//                               {"contentBlockIndex":0,"delta":{"text":"hi"}}
+//
+//     Nova on Invoke (key):     :event-type: chunk
+//                               {"contentBlockDelta":{"contentBlockIndex":0,
+//                                                     "delta":{"text":"hi"}}}
+//
+// The decoder matched `chunk` against its event names, found nothing, and skipped
+// every frame — a silent empty stream, which is the worst possible failure shape.
+//
+// The other Invoke dialects are untouched. Anthropic's payload keys are
+// `type`/`index`/`delta`/`message`/`usage`/`content_block`, the OpenAI-shaped ones
+// use `choices`/`id`/`model`, and the text ones `outputs`/`choices` — none of which
+// collide with a Converse event name, so they fall through to the header and their
+// own decoders read the payload themselves. Falling back to the header keeps
+// ConverseStream working unchanged.
+//
+// The lookup is over EVERY key, not just a single-key payload. Nova's terminal
+// frame is the exception that proves it:
+//
+//     {"metadata": {"usage": {...}, "metrics": {}, "trace": {}},
+//      "amazon-bedrock-invocationMetrics": {...}}
+//
+// Bedrock decorates the last frame with its own invocation metrics, so the payload
+// carries TWO top-level keys. An arity guard drops it, and the usage that rides on
+// `metadata` — the only usage a Converse-shaped stream ever reports — never reaches
+// the caller. The event-name lookup is the discriminator; arity never was.
+isolated function unwrapNamedEvent(string headerEventType, json payload) returns [string, json] {
+    if payload is map<json> {
+        foreach [string, json] [name, inner] in payload.entries() {
+            if isConverseEventName(name) {
+                return [name, inner];
+            }
+        }
+    }
+    return [headerEventType, payload];
+}
+
+// Whether a name is one of the `ConverseStream` event types.
+isolated function isConverseEventName(string name) returns boolean =>
+    name == CONVERSE_EVT_MESSAGE_START || name == CONVERSE_EVT_CONTENT_BLOCK_START ||
+    name == CONVERSE_EVT_CONTENT_BLOCK_DELTA || name == CONVERSE_EVT_CONTENT_BLOCK_STOP ||
+    name == CONVERSE_EVT_MESSAGE_STOP || name == CONVERSE_EVT_METADATA;
+
+// Unwraps an InvokeModelWithResponseStream frame body.
+//
+// Every frame on the Invoke route is `:event-type: chunk` with a payload of
+// `{"bytes": "<base64>"}`, whose decoded content is the VENDOR's own event JSON.
+// Converse has no such wrapper — the frame body is the event.
+isolated function unwrapInvokeChunk(json payload) returns json|ai:Error {
+    if payload !is map<json> {
+        return error ai:LlmInvalidResponseError("Bedrock Invoke stream frame was not a JSON object");
+    }
+    string? encoded = strField(payload, "bytes");
+    if encoded is () {
+        return error ai:LlmInvalidResponseError("Bedrock Invoke stream frame carried no 'bytes' member");
+    }
+    byte[]|error decoded = array:fromBase64(encoded);
+    if decoded is error {
+        return error ai:LlmInvalidResponseError("Bedrock Invoke stream frame 'bytes' was not valid base64", decoded);
+    }
+    string text = check bytesToString(decoded);
+    json|error parsed = text.fromJsonString();
+    if parsed is error {
+        return error ai:LlmInvalidResponseError("Bedrock Invoke stream frame payload was not valid JSON", parsed);
     }
     return parsed;
 }
