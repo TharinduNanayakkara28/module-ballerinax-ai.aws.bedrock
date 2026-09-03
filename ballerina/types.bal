@@ -13,11 +13,11 @@
 // limitations under the License.
 
 // ============================================================================
-// Public enums — design §10.
+// Public enums.
 // ============================================================================
 
-# Route selection on the common config, plus the resolved wire family (design §5,
-# amendment). `AUTO` (the config default) runs the resolver ladder; `CONVERSE`,
+# Route selection on the common config, plus the resolved wire family.
+# `AUTO` (the config default) runs the resolver ladder; `CONVERSE`,
 # `INVOKE`, `MANTLE` force that family. A resolved `Route.family` is never `AUTO`.
 public enum ApiFamily {
     AUTO,
@@ -26,32 +26,17 @@ public enum ApiFamily {
     MANTLE
 }
 
-# Body schema selector for `imported-model/` ARNs, where AWS applies no default
-# chat template and the codec cannot be inferred from the id (design §5.4, §7.2).
-public enum ModelSchema {
-    ANTHROPIC,
-    OPENAI,
-    NOVA,
-    LLAMA,
-    # Mistral's `messages`/`choices` chat-completion dialect (Mistral Large 24.07).
-    MISTRAL,
-    # Mistral's `prompt`/`outputs` text-completion dialect (7B, Mixtral, Large 24.02).
-    # A SEPARATE schema because the two dialects share a vendor prefix but no wire
-    # shape, and an imported model's id cannot tell them apart.
-    # https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-mistral-text-completion.html
-    MISTRAL_TEXT,
-    # DeepSeek-R1's `prompt`/`choices[].text` text-completion dialect. DeepSeek V3.1
-    # and V3.2 speak OpenAI-shaped chat completion on InvokeModel instead — use
-    # `OPENAI` for an imported model of that generation.
-    # https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-deepseek.html
-    DEEPSEEK
-}
+# A CONCRETE wire family — `ApiFamily` minus `AUTO`. `AUTO` is an instruction to the
+# resolver ("pick one"), not a destination, so it is unrepresentable everywhere a
+# family has already been decided. Module-private: a resolved `Route.family` is the
+# only place a decided family is stored, and that record is internal.
+type RouteFamily CONVERSE|INVOKE|MANTLE;
 
-# How a wire dialect forces a single named tool (design §8). This is a property of
-# the CODEC, not the route: Nova on InvokeModel is Converse-shaped, and Mistral's
+# How a wire dialect forces a single named tool. This is a property of
+# the CONVERTER, not the route: Nova on InvokeModel is Converse-shaped, and Mistral's
 # chat dialect looks OpenAI-shaped but forces tools with the bare string `"any"`.
 # Deriving it from `ApiFamily` silently emits the wrong field for those dialects.
-# Module-private: it lives on the internal `ModelCodec`, never on user config.
+# Module-private: it lives on the internal `ModelConverter`, never on user config.
 enum ToolChoiceStyle {
     # Converse: `toolConfig.toolChoice = {"tool": {"name": ...}}`.
     CONVERSE_TOOL_CHOICE,
@@ -76,14 +61,75 @@ enum ToolChoiceStyle {
     NO_TOOL_CHOICE
 }
 
-# Auth-header style for a Mantle model. Per-model data, not derivable from the
-# vendor prefix (design §7.3, open item #1).
-public enum AuthHeaderStyle {
-    X_API_KEY,
-    BEARER
+# Fields forwarded verbatim to the model — the escape hatch for anything Bedrock
+# exposes that this module does not model (`top_p`, `top_k`, Nova `reasoningConfig`,
+# `anthropic_beta`, prompt-caching `cache_control`, …).
+#
+# An OPEN record, deliberately: a field AWS ships after this release works today,
+# with no module update. A closed record would make an unknown field a compile error,
+# which is the opposite of what a passthrough is for.
+#
+# The rest type is `anydata` (the `record {}` default), so the value is NOT directly
+# assignable to a `json` request body — every wire boundary goes through
+# `additionalFieldsToJson`. That conversion is total: `toJson` deep-converts anydata
+# that is not already json (an `xml` value becomes its string form) rather than
+# failing, so there is no error path for a caller to handle.
+#
+# Keys for undeclared fields must be QUOTED string literals — `{"top_p": 0.9}`.
+# `{top_p: 0.9}` is a compile error: identifiers cannot be used as rest-field keys.
+public type AdditionalRequestFields record {
+};
+
+# How Claude allocates internal reasoning before answering.
+#
+# A closed, AWS-documented shape, which is why it is a record and not raw `json`:
+# the wire spelling (`type`, `budget_tokens`) and the mode/budget pairing rules are
+# all things a typed field can enforce at construction instead of surfacing as a 400.
+public enum ThinkingMode {
+    # Claude decides when and how much to think. The recommended mode, and the ONLY
+    # one supported by Claude Mythos 5, Fable 5, Opus 4.7 and Mythos Preview —
+    # `ENABLED`/`DISABLED` return a 400 on those. Pair with `effort` to steer depth.
+    ADAPTIVE = "adaptive",
+    # Manual budget via `budgetTokens`. Deprecated on Opus 4.6 / Sonnet 4.6 and
+    # unsupported on the adaptive-only models above.
+    ENABLED = "enabled",
+    # No extended thinking.
+    DISABLED = "disabled"
 }
 
-# Converse `serviceTier` passthrough (design §9.3).
+# Extended/adaptive thinking configuration for Claude.
+public type ThinkingConfig record {|
+    # Thinking mode. Defaults to `ADAPTIVE`, which every current Claude accepts.
+    ThinkingMode mode = ADAPTIVE;
+    # Reasoning-token budget. Valid ONLY with `ENABLED`, minimum 1024, and must be
+    # less than `maxTokens`. All three rules are checked at construction.
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html
+    int budgetTokens?;
+|};
+
+# How much reasoning the model should spend, emitted as `output_config.effort`.
+#
+# This is a SIBLING of `thinking` on the wire, never a field inside it — AWS
+# documents that nesting it under `thinking` returns a `ValidationException`. Keeping
+# it a separate config field makes that mistake unrepresentable.
+#
+# It is also the only depth control available on the adaptive-only models
+# (Mythos 5, Fable 5, Opus 4.7, Mythos Preview), where `budgetTokens` is a 400.
+# https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
+public enum Effort {
+    # Minimises thinking; may skip it entirely on simple tasks.
+    EFFORT_LOW = "low",
+    # Moderate thinking.
+    EFFORT_MEDIUM = "medium",
+    # The default. Claude always thinks.
+    EFFORT_HIGH = "high",
+    # Extended depth. Claude Opus 5 and Opus 4.6 ONLY.
+    EFFORT_XHIGH = "xhigh",
+    # No constraint on depth. Claude Opus 5 and Opus 4.6 ONLY.
+    EFFORT_MAX = "max"
+}
+
+# Converse `serviceTier` passthrough.
 #
 # Values are AWS's, verbatim. Note there is no "standard" tier — the baseline is
 # spelled `default`. The member names carry a `TIER_` prefix because a bare
@@ -100,7 +146,7 @@ public enum ServiceTier {
     TIER_RESERVED = "reserved"
 }
 
-# Whether a guardrail intervened on a response (design §9.5).
+# Whether a guardrail intervened on a response.
 # Module-private: only reachable via the internal `DecodedResponse`.
 enum GuardrailAction {
     INTERVENED,
@@ -108,18 +154,33 @@ enum GuardrailAction {
 }
 
 // ============================================================================
-// Route resolution result — design §5.3.
+// Route resolution result.
 // ============================================================================
 
-# A single Mantle model's wire contract. Path, auth style, and codec are all
-# per-model data (design §7.3) — none is derivable from the vendor prefix.
-public type MantleEntry record {|
+# A single Mantle model's wire contract. Module-private routing-table data.
+#
+# The PATH is the only per-model fact here. Converter and auth-header style used to be
+# stored alongside it and are now DERIVED from the path (see `mantleConverterForPath`
+# and `usesApiKeyHeader`), because path → dialect is 1:1 across every model AWS
+# serves on Mantle. They are not derivable from the VENDOR prefix, which is the
+# mistake this shape invites: `google.gemma-3-*` speaks Chat Completions on `/v1`
+# while `google.gemma-4-*` speaks Responses on `/openai/v1` — one prefix, two
+# dialects. Keying off the path keeps that distinction intact with no extra fields.
+type MantleEntry record {|
     # Request path on the `bedrock-mantle` host, e.g. `/anthropic/v1/messages`.
     string path;
-    # Auth-header style AWS documents for this model.
-    AuthHeaderStyle authHeader;
-    # Codec key selecting the encode/decode pair for this Mantle dialect.
-    MantleCodecKey codec;
+
+    # Whether this model is ALSO served on `bedrock-runtime` (Converse/InvokeModel).
+    #
+    # Drives the `generate()` fallback: under `AUTO` a Mantle-capable model routes
+    # chat to Mantle, which has no structured output — but when the same model is on
+    # `bedrock-runtime`, a typed `generate()` can quietly use Converse instead of
+    # failing. A Mantle-ONLY model (GPT-5.x, Mythos, Gemma 4) has no such route, so it
+    # keeps the clean error rather than being sent to an endpoint that does not serve
+    # it. Verified per model against AWS's API-compatibility matrix.
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/models-api-compatibility.html
+    boolean onRuntime = false;
+
     # The id to put on the wire when it DIFFERS from the `bedrock-runtime` id.
     #
     # For most models the two endpoints share an id, and this is omitted. But some
@@ -130,30 +191,22 @@ public type MantleEntry record {|
     string modelId?;
 |};
 
-# Names the Mantle wire dialect a `MantleEntry` speaks. Kept as a key (not the
-# codec value itself) so the routing tables in `constants.bal` stay pure data.
-public enum MantleCodecKey {
-    RESPONSES_CODEC,
-    MESSAGES_CODEC,
-    CHAT_CODEC
-}
-
-# The fully resolved route — produced once by `resolveRoute` at construction
-# (design §5.3, §6). Everything downstream (endpoint, codec, transport) reads
-# from this. Module-private: the resolver's output, mirroring the private `Endpoint`.
+# The fully resolved route — produced once by `resolveRoute` at construction.
+# Everything downstream (endpoint, converter, transport) reads from this.
+# Module-private: the resolver's output, mirroring the private `Endpoint`.
 type Route record {|
-    # The resolved wire dialect.
-    ApiFamily family;
+    # The resolved wire dialect. Never `AUTO` — see `RouteFamily`.
+    RouteFamily family;
     # Lookup key with any CRIS geo prefix stripped, e.g. `anthropic.claude-opus-4-8`.
     string bareModelId;
-    # The stripped CRIS geo prefix, re-applied per family on the wire (design §5.3).
+    # The stripped CRIS geo prefix, re-applied per family on the wire.
     string? geoPrefix;
     # The id that goes on the wire — family-specific (CRIS-prefixed for Converse/
     # Invoke, bare for Mantle, or the raw ARN for opaque ARNs).
     string effectiveModelId;
-    # Region. An ARN's region segment overrides `config.region` (design §5.2).
+    # Region. An ARN's region segment overrides `config.region`.
     string region;
-    # Partition: `aws` | `aws-cn` | `aws-us-gov` (design §9.2).
+    # Partition: `aws` | `aws-cn` | `aws-us-gov`.
     string partition;
     # Present only for MANTLE routes.
     MantleEntry? mantleEntry;
@@ -165,12 +218,8 @@ type Route record {|
 
 # The subset of a vendor `*Config` that `resolveRoute` (pure) needs. Each vendor
 # `init` builds this from its own config record, keeping the resolver decoupled
-# from the seven per-vendor config shapes (design §5.1, §6). Module-private input.
+# from the seven per-vendor config shapes. Module-private input.
 type RouteConfig record {|
-    # Explicit route override — outranks every heuristic (design §5.1 step 1).
+    # Explicit route override — outranks every heuristic.
     ApiFamily apiFamily?;
-    # Required for `imported-model/` ARNs (design §5.4).
-    ModelSchema modelSchema?;
-    # Extends the routing tables without a release (design §5.1 step 3, §7.3).
-    map<ApiFamily|MantleEntry> routeOverrides?;
 |};

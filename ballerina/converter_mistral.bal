@@ -14,7 +14,7 @@
 
 import ballerina/ai;
 
-// Mistral on the InvokeModel route (design §7.2). Mistral ships TWO mutually
+// Mistral on the InvokeModel route. Mistral ships TWO mutually
 // incompatible Invoke dialects, and the model id is the only discriminator:
 //
 //   text completion  — `prompt` (a `<s>[INST]…[/INST]` template) → `outputs[].text`
@@ -28,23 +28,27 @@ import ballerina/ai;
 // The chat dialect resembles OpenAI's but is NOT interchangeable with it: the stop
 // reason is `stop_reason` (not `finish_reason`), tools are forced with the bare
 // string `"any"` (not an object naming the tool), and AWS documents no `usage`
-// block at all. Routing Mistral through the OpenAI codec leaves `stopReason` empty
-// and breaks tool forcing, so both dialects get their own codec here.
+// block at all. Routing Mistral through the OpenAI converter leaves `stopReason` empty
+// and breaks tool forcing, so both dialects get their own converter here.
 
 // ============================================================================
 // Chat completion — Mistral Large 24.07.
 // ============================================================================
 
-// Encodes a Mistral chat-completion request body (§7.2). This dialect DOES carry
+// Encodes a Mistral chat-completion request body. This dialect DOES carry
 // `system` as a `role: system` message — the AWS page lists `"system"` among the
-// valid roles — so the hoisted system (§7.1) is re-added as the leading message.
-isolated function encodeMistralChat(ai:ChatSystemMessage? system, ai:ChatMessage[] messages,
+// valid roles — so the hoisted system is re-added as the leading message.
+isolated function encodeMistralChat(string? system, ResolvedMessage[] messages,
         ai:ChatCompletionFunctions[] tools, string? stop, InferenceParams params) returns json|ai:Error {
+    // UNVERIFIED and CONTESTED: AWS documents this dialect's `content` as a string,
+    // while Mistral's own API documents image_url chunks. Two first-party sources
+    // disagree, so per the module's ground rules this refuses rather than picking one.
+    check rejectImagesIn(messages, "the Mistral chat-completion dialect", true);
     json[] wire = [];
-    if system is ai:ChatSystemMessage {
-        wire.push({"role": "system", "content": contentToString(system.content)});
+    if system is string {
+        wire.push({"role": "system", "content": system});
     }
-    foreach ai:ChatMessage m in messages {
+    foreach ResolvedMessage m in messages {
         wire.push(mistralChatMessage(m));
     }
 
@@ -60,7 +64,7 @@ isolated function encodeMistralChat(ai:ChatSystemMessage? system, ai:ChatMessage
     // sent verbatim by default.
     string[]? stops = params.stopSequences;
     if stop is string {
-        stops = [stop]; // per-call stop overrides configured stopSequences (§7)
+        stops = [stop]; // per-call stop overrides configured stopSequences
     }
     if stops is string[] && stops.length() > 0 {
         body["stop"] = stops;
@@ -75,7 +79,7 @@ isolated function encodeMistralChat(ai:ChatSystemMessage? system, ai:ChatMessage
         }
         body["tools"] = toolDefs;
     }
-    json extra = params?.additionalModelRequestFields;
+    map<json>? extra = additionalFieldsToJson(params?.additionalModelRequestFields);
     if extra is map<json> {
         foreach [string, json] [k, v] in extra.entries() {
             body[k] = v;
@@ -84,10 +88,10 @@ isolated function encodeMistralChat(ai:ChatSystemMessage? system, ai:ChatMessage
     return body;
 }
 
-// Maps one `ai:ChatMessage` to a Mistral chat-completion message (§7.1).
-isolated function mistralChatMessage(ai:ChatMessage m) returns json {
-    if m is ai:ChatUserMessage {
-        return {"role": "user", "content": contentToString(m.content)};
+// Maps one resolved message to a Mistral chat-completion message.
+isolated function mistralChatMessage(ResolvedMessage m) returns json {
+    if m is ResolvedUserMessage {
+        return {"role": "user", "content": openAIContentParts(m.parts)};
     }
     if m is ai:ChatAssistantMessage {
         map<json> msg = {"role": "assistant", "content": m.content ?: ""};
@@ -106,13 +110,10 @@ isolated function mistralChatMessage(ai:ChatMessage m) returns json {
         }
         return msg;
     }
-    if m is ai:ChatFunctionMessage {
-        return {"role": "tool", "tool_call_id": m.id ?: m.name, "content": m.content ?: ""};
-    }
-    return {"role": "user", "content": contentToString(m.content)};
+    return {"role": "tool", "tool_call_id": m.id ?: m.name, "content": m.content ?: ""};
 }
 
-// Decodes a Mistral chat-completion response (§7). The stop reason is
+// Decodes a Mistral chat-completion response. The stop reason is
 // `stop_reason` — NOT OpenAI's `finish_reason`.
 isolated function decodeMistralChat(json response) returns DecodedResponse|ai:Error {
     map<json>|error rr = response.ensureType();
@@ -131,7 +132,7 @@ isolated function decodeMistralChat(json response) returns DecodedResponse|ai:Er
     map<json> choice = choiceResult;
     // `stop_reason` per the AWS page; fall back to `finish_reason` because the
     // live API also emits the OpenAI spelling on some ids. stopReason is a module
-    // invariant (§7) — it is never left empty.
+    // invariant — it is never left empty.
     string stopReason = strField(choice, "stop_reason") ?: strField(choice, "finish_reason") ?: "stop";
 
     string text = "";
@@ -178,8 +179,7 @@ isolated function decodeMistralChat(json response) returns DecodedResponse|ai:Er
         usage: {inputTokens, outputTokens},
         stopReason,
         responseId: strField(r, "id"),
-        guardrailAction: invokeGuardrailAction(r), // body field (§9.5)
-        additionalModelResponseFields: ()
+        guardrailAction: invokeGuardrailAction(r) // body field
     };
 }
 
@@ -187,11 +187,13 @@ isolated function decodeMistralChat(json response) returns DecodedResponse|ai:Er
 // Text completion — Mistral 7B Instruct, Mixtral 8X7B, Mistral Large 24.02.
 // ============================================================================
 
-// Encodes a Mistral text-completion request body (§7.2). There is no `messages`
+// Encodes a Mistral text-completion request body. There is no `messages`
 // array on this dialect: the conversation must be flattened into one `prompt`
 // string using Mistral's instruction template.
-isolated function encodeMistralText(ai:ChatSystemMessage? system, ai:ChatMessage[] messages,
+isolated function encodeMistralText(string? system, ResolvedMessage[] messages,
         ai:ChatCompletionFunctions[] tools, string? stop, InferenceParams params) returns json|ai:Error {
+    // Text-only by construction: a single prompt string, no content-part array.
+    check rejectImagesIn(messages, "the Mistral text-completion dialect");
     if tools.length() > 0 {
         // Fail loudly rather than drop the tools: this dialect has no tool support
         // at all, so a silent no-op would look like the model ignoring the tool.
@@ -207,13 +209,13 @@ isolated function encodeMistralText(ai:ChatSystemMessage? system, ai:ChatMessage
     setTemperature(body, params);
     string[]? stops = params.stopSequences;
     if stop is string {
-        stops = [stop]; // per-call stop overrides configured stopSequences (§7)
+        stops = [stop]; // per-call stop overrides configured stopSequences
     }
     if stops is string[] && stops.length() > 0 {
         body["stop"] = stops;
     }
-    // `top_k` is a text-completion-only parameter; it rides the §9.3 passthrough.
-    json extra = params?.additionalModelRequestFields;
+    // `top_k` is a text-completion-only parameter; it rides the passthrough.
+    map<json>? extra = additionalFieldsToJson(params?.additionalModelRequestFields);
     if extra is map<json> {
         foreach [string, json] [k, v] in extra.entries() {
             body[k] = v;
@@ -234,13 +236,15 @@ isolated function encodeMistralText(ai:ChatSystemMessage? system, ai:ChatMessage
 // NOTE: AWS does not document how `system` maps onto this dialect — the template
 // has no system slot. We prepend it to the first instruction block, which is what
 // Mistral's own chat template does, and it preserves the module invariant that
-// system is never emitted as a `role: system` message (§7.1).
-isolated function mistralInstructPrompt(ai:ChatSystemMessage? system, ai:ChatMessage[] messages) returns string {
+// system is never emitted as a `role: system` message.
+isolated function mistralInstructPrompt(string? system, ResolvedMessage[] messages) returns string {
+    // Images are rejected by the caller (`encodeMistralText`): this dialect is a single
+    // prompt string with no content-part array to put one in.
     string prompt = "<s>";
-    boolean systemPending = system is ai:ChatSystemMessage;
-    string systemText = system is ai:ChatSystemMessage ? contentToString(system.content) : "";
+    boolean systemPending = system is string;
+    string systemText = system ?: "";
 
-    foreach ai:ChatMessage m in messages {
+    foreach ResolvedMessage m in messages {
         if m is ai:ChatAssistantMessage {
             string? content = m.content;
             prompt += string ` ${content ?: ""}</s>`;
@@ -248,7 +252,7 @@ isolated function mistralInstructPrompt(ai:ChatSystemMessage? system, ai:ChatMes
         }
         // User (and any tool result, which has nowhere else to go on this dialect)
         // becomes an instruction block.
-        string text = m is ai:ChatFunctionMessage ? (m.content ?: "") : contentToString(m.content);
+        string text = m is ai:ChatFunctionMessage ? (m.content ?: "") : partsText(m.parts);
         if systemPending {
             text = systemText + "\n\n" + text;
             systemPending = false;
@@ -262,7 +266,7 @@ isolated function mistralInstructPrompt(ai:ChatSystemMessage? system, ai:ChatMes
     return prompt;
 }
 
-// Decodes a Mistral text-completion response (§7): `outputs[].text` +
+// Decodes a Mistral text-completion response: `outputs[].text` +
 // `outputs[].stop_reason`. This dialect returns no token counts and no id.
 isolated function decodeMistralText(json response) returns DecodedResponse|ai:Error {
     map<json>|error rr = response.ensureType();
@@ -282,13 +286,12 @@ isolated function decodeMistralText(json response) returns DecodedResponse|ai:Er
     string text = strField(output, "text") ?: "";
     return {
         message: {role: ai:ASSISTANT, content: text == "" ? () : text},
-        // No usage on this dialect; `usage` stays populated (§7) with zeroes.
+        // No usage on this dialect; `usage` stays populated with zeroes.
         usage: {inputTokens: 0, outputTokens: 0},
         stopReason: strField(output, "stop_reason") ?: "stop",
         // No response id in the body; the transport fills it from the request-id
-        // header (§9.5).
+        // header.
         responseId: (),
-        guardrailAction: invokeGuardrailAction(r), // body field (§9.5)
-        additionalModelResponseFields: ()
+        guardrailAction: invokeGuardrailAction(r) // body field
     };
 }

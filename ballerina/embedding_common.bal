@@ -16,44 +16,48 @@ import ballerina/ai;
 import ballerina/ai.observe;
 import ballerina/http;
 
-// Shared embedding machinery (embedding design §5, §7). Batching lives HERE,
-// parameterized by `codec.maxBatchSize`, because the wire limits differ per
-// family (Titan 1, Cohere 96) and no codec can batch alone.
+// Shared embedding machinery. Batching lives HERE,
+// parameterized by `converter.maxBatchSize`, because the wire limits differ per
+// family (Titan 1, Cohere 96) and no converter can batch alone.
 
-// Builds the embedding spine. There is NO routing ladder (embedding design §5):
+// Builds the embedding spine. There is NO routing ladder:
 // embeddings are InvokeModel-only, so the family is forced to `INVOKE`. CRIS
 // normalization still applies — Cohere Embed v4 is offered cross-region, so
-// `us.cohere.embed-v4` must strip for lookup and restore on the wire (§5.3).
+// `us.cohere.embed-v4` must strip for lookup and restore on the wire.
 // Returns the wire model id and the transport.
 isolated function resolveEmbeddingSpine(string providerName, BedrockCredentials credentials,
-        string model, string region, string familyPrefix, string exampleId,
-        string? signingServiceName, http:ClientConfiguration? httpConfig, RetryConfig? retryConfig)
+        string model, string region, string serviceUrl, string familyPrefix, string exampleId,
+        http:ClientConfiguration? httpConfig, RetryConfig? retryConfig, boolean fips = false)
         returns [string, BedrockTransport]|ai:Error {
     do {
-        // v1: ARNs are out of scope — an ARN carries no vendor prefix, so no codec
-        // can be resolved from it (embedding design §5).
+        // Embeddings take a bare model id, never an ARN, so the region can only come
+        // from the argument (or AWS_REGION behind `defaultRegion`) — there is no ARN
+        // segment to fall back on.
+        check guardRegion(region);
+        // v1: ARNs are out of scope — an ARN carries no vendor prefix, so no converter
+        // can be resolved from it.
         if isArn(model) {
             return error ai:Error("provisioned-model ARNs are not supported for embeddings; " +
-                "pass the base model id (embedding design §5)");
+                "pass the base model id");
         }
         [string, string?] [bareId, geoPrefix] = normalizeModelId(model);
         if !bareId.startsWith(familyPrefix) {
             return error ai:Error(string `'${model}' is not a ${providerName} model; supported ids ` +
                 string `start with '${familyPrefix}' (e.g. '${exampleId}')`);
         }
-        // Embeddings: InvokeModel only — no Converse equivalent, no streaming (§1).
+        // Embeddings: InvokeModel only — no Converse equivalent, no streaming.
         Route route = {
             family: INVOKE,
             bareModelId: bareId,
             geoPrefix,
-            effectiveModelId: applyGeoPrefix(bareId, geoPrefix), // CRIS restored on the wire (§5.3)
+            effectiveModelId: applyGeoPrefix(bareId, geoPrefix), // CRIS restored on the wire
             region,
             partition: partitionForRegion(region),
             mantleEntry: ()
         };
-        Endpoint ep = check buildEndpoint(route);
+        Endpoint ep = check buildEndpoint(route, serviceUrl, fips);
         BedrockTransport transport =
-            check new (credentials, route.region, ep, signingServiceName, httpConfig, retryConfig);
+            check new (credentials, route.region, ep, httpConfig, retryConfig);
         return [route.effectiveModelId, transport];
     } on fail error e {
         if e is ai:Error {
@@ -75,17 +79,17 @@ type EmbedTransport isolated object {
     isolated function execute(json body, map<string> extraHeaders = {}) returns TransportResponse|ai:Error;
 };
 
-// The shared `batchEmbed` implementation (embedding design §7). Windows the texts
-// by `codec.maxBatchSize` (Titan → n windows of 1; Cohere → ceil(n/96)) and
+// The shared `batchEmbed` implementation. Windows the texts
+// by `converter.maxBatchSize` (Titan → n windows of 1; Cohere → ceil(n/96)) and
 // reassembles BY INDEX — order is the contract, and index-based reassembly keeps a
 // future concurrent implementation from becoming a correctness change.
 isolated function runBatchEmbed(string providerName, string wireModelId,
-        readonly & EmbeddingCodec codec, EmbedTransport transport,
+        readonly & EmbeddingConverter converter, EmbedTransport transport,
         readonly & EmbeddingParams params, ai:Chunk[] chunks) returns ai:Embedding[]|ai:Error {
     observe:EmbeddingSpan span = observe:createEmbeddingSpan(wireModelId);
     span.addProvider(providerName);
 
-    // The scope boundary is the contract's, not ours: ai:Chunk carries text (§2).
+    // The scope boundary is the contract's, not ours: ai:Chunk carries text.
     if !isAllTextChunks(chunks) {
         ai:Error err = error ai:Error(
             "Unsupported chunk type. Expected elements of type 'ai:TextChunk|ai:TextDocument'.");
@@ -99,9 +103,9 @@ isolated function runBatchEmbed(string providerName, string wireModelId,
     int totalTokens = 0;
     boolean sawTokens = false;
     int index = 0;
-    // Titan (maxBatchSize 1) → n windows; Cohere (96) → ceil(n/96) windows (§7).
-    foreach string[] window in partitionTexts(texts, codec.maxBatchSize) {
-        EncodeEmbedRequest encode = codec.encode;
+    // Titan (maxBatchSize 1) → n windows; Cohere (96) → ceil(n/96) windows.
+    foreach string[] window in partitionTexts(texts, converter.maxBatchSize) {
+        EncodeEmbedRequest encode = converter.encode;
         json|ai:Error body = encode(window, params);
         if body is ai:Error {
             span.close(body);
@@ -112,7 +116,7 @@ isolated function runBatchEmbed(string providerName, string wireModelId,
             span.close(response);
             return response;
         }
-        DecodeEmbedResponse decode = codec.decode;
+        DecodeEmbedResponse decode = converter.decode;
         DecodedEmbedding|ai:Error decoded = decode(response.body);
         if decoded is ai:Error {
             span.close(decoded);
@@ -124,7 +128,7 @@ isolated function runBatchEmbed(string providerName, string wireModelId,
             span.close(err);
             return err;
         }
-        // ORDER IS THE CONTRACT — reassemble by absolute index (§7).
+        // ORDER IS THE CONTRACT — reassemble by absolute index.
         foreach int offset in 0 ..< decoded.embeddings.length() {
             result[index + offset] = decoded.embeddings[offset];
         }
@@ -137,7 +141,7 @@ isolated function runBatchEmbed(string providerName, string wireModelId,
     }
 
     span.addResponseModel(wireModelId);
-    // Cohere reports no token count — guard the span call (§2, §7).
+    // Cohere reports no token count — guard the span call.
     if sawTokens {
         span.addInputTokenCount(totalTokens);
     }
@@ -145,19 +149,19 @@ isolated function runBatchEmbed(string providerName, string wireModelId,
     return result;
 }
 
-// `embed` is just `batchEmbed([chunk])[0]` — exactly one code path (§7).
-isolated function runEmbed(string providerName, string wireModelId, readonly & EmbeddingCodec codec,
+// `embed` is just `batchEmbed([chunk])[0]` — exactly one code path.
+isolated function runEmbed(string providerName, string wireModelId, readonly & EmbeddingConverter converter,
         EmbedTransport transport, readonly & EmbeddingParams params, ai:Chunk chunk)
         returns ai:Embedding|ai:Error {
     ai:Embedding[] embeddings =
-        check runBatchEmbed(providerName, wireModelId, codec, transport, params, [chunk]);
+        check runBatchEmbed(providerName, wireModelId, converter, transport, params, [chunk]);
     if embeddings.length() == 0 {
         return error ai:LlmInvalidResponseError("No embedding was generated for the provided chunk");
     }
     return embeddings[0];
 }
 
-// Splits texts into wire-sized windows (embedding design §7). One window == one
+// Splits texts into wire-sized windows. One window == one
 // InvokeModel round trip, so this function alone decides the request count:
 // 100 texts → Titan (1) 100 requests; Cohere (96) 2 requests of 96 + 4.
 isolated function partitionTexts(string[] texts, int maxBatchSize) returns string[][] {
@@ -174,7 +178,7 @@ isolated function partitionTexts(string[] texts, int maxBatchSize) returns strin
     return windows;
 }
 
-// `true` when every chunk carries text (embedding design §2).
+// `true` when every chunk carries text.
 isolated function isAllTextChunks(ai:Chunk[] chunks) returns boolean
     => chunks.every(chunk => chunk is ai:TextChunk|ai:TextDocument);
 

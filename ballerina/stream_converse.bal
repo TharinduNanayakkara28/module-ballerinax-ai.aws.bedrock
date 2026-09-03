@@ -19,7 +19,7 @@ import ballerina/ai;
 // The highest-leverage decoder in the module: `ConverseStream` is model-agnostic,
 // so this one mapping serves all seven vendor facades on the default route. Nova on
 // `InvokeModelWithResponseStream` reuses it too — its framed payloads are
-// Converse-shaped, the same pairing that lets `INVOKE_NOVA_CODEC` reuse
+// Converse-shaped, the same pairing that lets `INVOKE_NOVA_CONVERTER` reuse
 // `decodeConverse`.
 //
 // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html

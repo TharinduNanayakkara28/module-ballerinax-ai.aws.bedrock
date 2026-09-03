@@ -31,7 +31,7 @@ import ballerina/ai;
 // buffered body above, but neither page prints a streamed chunk. This follows the
 // Bedrock convention every other Invoke vendor observes — each frame repeats the
 // buffered shape with a PARTIAL `text`, and the last one carries
-// `amazon-bedrock-invocationMetrics` — which is also what `INVOKE_NOVA_CODEC`'s
+// `amazon-bedrock-invocationMetrics` — which is also what `INVOKE_NOVA_CONVERTER`'s
 // metrics frame demonstrates live. Accepting both array keys and treating a missing
 // one as "nothing to surface" keeps a wrong guess from erroring a good stream.
 //

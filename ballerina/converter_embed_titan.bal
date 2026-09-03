@@ -14,14 +14,14 @@
 
 import ballerina/ai;
 
-// Amazon Titan text embeddings (embedding design §1, §7).
+// Amazon Titan text embeddings.
 // Request:  {"inputText": string, "dimensions": int, "normalize": bool}
 // Response: {"embedding": [floats], "inputTextTokenCount": int}
 // `inputText` is a STRING, not an array — Titan embeds exactly ONE text per call,
 // which is why maxBatchSize is 1 and batchEmbed becomes n sequential calls.
 // https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-titan-embed-text.html
 
-// Titan embeds exactly one text per InvokeModel call (embedding design §1).
+// Titan embeds exactly one text per InvokeModel call.
 const int TITAN_MAX_BATCH = 1;
 
 // Titan Embed V1 ids, which have NO `dimensions` parameter (V2 added it). Strips
@@ -32,19 +32,19 @@ isolated function isTitanEmbedV1(string modelId) returns boolean {
     return bareId.startsWith("amazon.titan-embed-text-v1");
 }
 
-// The Titan embedding codec (embedding design §7).
-final readonly & EmbeddingCodec TITAN_EMBED_CODEC = {
+// The Titan embedding converter.
+final readonly & EmbeddingConverter TITAN_EMBED_CONVERTER = {
     maxBatchSize: TITAN_MAX_BATCH,
     encode: encodeTitanEmbed,
     decode: decodeTitanEmbed
 };
 
 // Encodes a Titan embedding request. `texts` must hold exactly one element —
-// `inputText` is a single string on the wire (embedding design §1).
+// `inputText` is a single string on the wire.
 isolated function encodeTitanEmbed(string[] texts, EmbeddingParams params) returns json|ai:Error {
     if texts.length() != 1 {
         return error ai:Error(string `Titan embeds exactly one text per call; got ${texts.length()}. ` +
-            string `This is a batching bug — windows must be sized by codec.maxBatchSize.`);
+            string `This is a batching bug — windows must be sized by converter.maxBatchSize.`);
     }
     map<json> body = {"inputText": texts[0]}; // a STRING, never an array
     int? dimensions = params?.dimensions;
@@ -55,7 +55,7 @@ isolated function encodeTitanEmbed(string[] texts, EmbeddingParams params) retur
     if normalize is boolean {
         body["normalize"] = normalize;
     }
-    json extra = params?.additionalModelRequestFields;
+    map<json>? extra = additionalFieldsToJson(params?.additionalModelRequestFields);
     if extra is map<json> {
         foreach [string, json] [k, v] in extra.entries() {
             body[k] = v;
@@ -64,7 +64,7 @@ isolated function encodeTitanEmbed(string[] texts, EmbeddingParams params) retur
     return body;
 }
 
-// Decodes a Titan embedding response (embedding design §7). Titan DOES report an
+// Decodes a Titan embedding response. Titan DOES report an
 // input token count.
 isolated function decodeTitanEmbed(json response) returns DecodedEmbedding|ai:Error {
     map<json>|error rr = response.ensureType();

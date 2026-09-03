@@ -12,23 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// resolveRoute — the §5.1 ladder. Pure: no I/O, no state, fully table-testable
-// without AWS credentials (design §5.1, §13.1). All construction-time routing
+// resolveRoute — the resolution ladder. Pure: no I/O, no state, fully table-testable
+// without AWS credentials. All construction-time routing
 // decisions are made here.
 
 // Resolves a model id (bare, CRIS-prefixed, ARN, or `mantle/|converse/|invoke/`
-// prefixed) to a fully-specified `Route` (design §5.1). Returns an `error` for
-// the cases AWS cannot diagnose for us (design principle 7): `custom-model/`
-// ARNs, `imported-model/` ARNs missing `modelSchema`, and `apiFamily = MANTLE`
-// on a model absent from `MANTLE_CAPABLE`.
+// prefixed) to a fully-specified `Route`. Returns an `error` for
+// the cases AWS cannot diagnose for us: `custom-model/` and `imported-model/`
+// ARNs, and `apiFamily = MANTLE` on a model absent from `MANTLE_CAPABLE`.
 isolated function resolveRoute(string model, string region, RouteConfig config = {}) returns Route|error {
     // ---- step 1: explicit override (prefix and/or config.apiFamily) ----
-    // AUTO (the config default) means "no forced family" — run the ladder (amendment).
-    [ApiFamily?, string] [prefixFamily, work] = stripRoutePrefix(model);
-    ApiFamily? configFamily = config.apiFamily == AUTO ? () : config.apiFamily;
-    ApiFamily? explicitFamily = configFamily ?: prefixFamily;
+    // AUTO (the config default) means "no forced family" — run the ladder.
+    [RouteFamily?, string] [prefixFamily, work] = stripRoutePrefix(model);
+    // Narrowing to `RouteFamily` IS the AUTO filter: `AUTO` is the one `ApiFamily`
+    // member that is not a destination, so anything that survives the type test is
+    // a forced family.
+    ApiFamily? rawConfigFamily = config.apiFamily;
+    RouteFamily? configFamily = rawConfigFamily is RouteFamily ? rawConfigFamily : ();
+    RouteFamily? explicitFamily = configFamily ?: prefixFamily;
 
-    // ---- step 2: ARN dispatch (region + partition are authoritative — §5.2) ----
+    // ---- step 2: ARN dispatch (region + partition are authoritative) ----
     if isArn(work) {
         return resolveArn(work, region, config, explicitFamily);
     }
@@ -40,9 +43,9 @@ isolated function resolveRoute(string model, string region, RouteConfig config =
 }
 
 // Splits an optional `mantle/|converse/|invoke/` route prefix off the model
-// string (design §5.1 step 1). Returns the implied family (if any) and the
+// string. Returns the implied family (if any) and the
 // remaining id.
-isolated function stripRoutePrefix(string model) returns [ApiFamily?, string] {
+isolated function stripRoutePrefix(string model) returns [RouteFamily?, string] {
     if model.startsWith("mantle/") {
         return [MANTLE, model.substring("mantle/".length())];
     }
@@ -55,9 +58,9 @@ isolated function stripRoutePrefix(string model) returns [ApiFamily?, string] {
     return [(), model];
 }
 
-// ARN dispatch — the resource-type token gives the family before any call
-// (design §5.1 step 2, §5.2). The ARN's region/partition override `config.region`.
-isolated function resolveArn(string arnStr, string region, RouteConfig config, ApiFamily? explicitFamily)
+// ARN dispatch — the resource-type token gives the family before any call.
+// The ARN's region/partition override `config.region`.
+isolated function resolveArn(string arnStr, string region, RouteConfig config, RouteFamily? explicitFamily)
         returns Route|error {
     ParsedArn arn = check parseArn(arnStr);
 
@@ -65,43 +68,44 @@ isolated function resolveArn(string arnStr, string region, RouteConfig config, A
         return error(string `not a Bedrock ARN: service segment is '${arn.'service}', expected 'bedrock'`);
     }
 
-    // The ARN's region is authoritative (§5.2) — but it is legitimately EMPTY on
+    // The ARN's region is authoritative — but it is legitimately EMPTY on
     // global ARNs such as `arn:aws:bedrock::123:foundation-model/anthropic.claude-v2`.
     // Copying "" through would build the host `bedrock-runtime..amazonaws.com` and
     // surface as an opaque DNS failure, so fall back to the caller's region.
     string arnRegion = arn.region == "" ? region : arn.region;
 
     // `foundation-model/` carries a bare, globally-addressable id — strip to it
-    // and fall through to the allowlists (design §5.1 step 2).
+    // and fall through to the allowlists.
     if arn.resourceType == "foundation-model" {
         return resolveBareId(arn.resourceId, arnRegion, arn.partition, config, explicitFamily);
     }
 
     // `custom-model/` is an artifact, not a deployment — AWS's prose directs
-    // users to the deployment/Provisioned-Throughput ARN (design §5.2). Policy
+    // users to the deployment/Provisioned-Throughput ARN. Policy
     // choice, recorded so a reviewer can overrule it.
     if arn.resourceType == "custom-model" {
         return error(string `'custom-model/' ARN is a model artifact, not a deployment; ` +
             string `pass the 'custom-model-deployment/' (on-demand) or 'provisioned-model/' ARN instead`);
     }
 
-    // Every remaining opaque ARN keeps its family through the sink (design §5.1
-    // step 6). Default family by resource type; an explicit override outranks it.
-    ApiFamily defaultFamily = arn.resourceType == "imported-model" ? INVOKE : CONVERSE;
-    ApiFamily family = explicitFamily ?: defaultFamily;
-
-    // `imported-model/` says nothing about the body schema (design §5.4): AWS
-    // applies no default chat template, so INVOKE needs `modelSchema`.
-    if family == INVOKE && arn.resourceType == "imported-model" && config.modelSchema is () {
-        return error(string `'imported-model/' ARN requires 'modelSchema' — AWS applies no default ` +
-            string `chat template for imported weights, so the request body cannot be built without it`);
+    // `imported-model/` (Custom Model Import) is out of scope. AWS applies no default
+    // chat template to imported weights, so the request body cannot be built without
+    // the caller naming the wire dialect — which was the whole job of the removed
+    // `modelSchema` config. Rather than keep a knob on every provider for a case
+    // integration developers do not hit, refuse it by name.
+    if arn.resourceType == "imported-model" {
+        return error(string `'imported-model/' ARNs are not supported: AWS applies no default chat ` +
+            string `template to imported weights, so this module cannot build a request body for them. ` +
+            string `Use a foundation-model, inference-profile, or provisioned-model ARN instead`);
     }
+
+    // Every remaining opaque ARN keeps its family through the sink.
+    RouteFamily family = explicitFamily ?: CONVERSE;
 
     MantleEntry? mantleEntry = ();
     if family == MANTLE {
-        // An opaque ARN is not a bare id, so it cannot be in MANTLE_CAPABLE
-        // unless the user supplied a routeOverride keyed by the ARN string.
-        mantleEntry = check mantleEntryFor(arnStr, config);
+        // An opaque ARN is not a bare id, so it cannot be in MANTLE_CAPABLE.
+        mantleEntry = check mantleEntryForBare(arnStr);
     }
 
     return {
@@ -116,38 +120,27 @@ isolated function resolveArn(string arnStr, string region, RouteConfig config, A
 }
 
 // Bare/CRIS-prefixed id: normalize (strip geo prefix, keep it) then walk ladder
-// steps 3-6 (design §5.1, §5.3).
+// steps 3-6.
 isolated function resolveBareId(string id, string region, string partition, RouteConfig config,
-        ApiFamily? explicitFamily) returns Route|error {
+        RouteFamily? explicitFamily) returns Route|error {
     [string, string?] [bareId, geoPrefix] = normalizeModelId(id);
 
     // step 1 (explicit): outranks the tables.
-    if explicitFamily is ApiFamily {
-        return buildBareRoute(explicitFamily, bareId, geoPrefix, region, partition, config);
+    if explicitFamily is RouteFamily {
+        return buildBareRoute(explicitFamily, bareId, geoPrefix, region, partition);
     }
 
-    // step 3: routeOverrides.
-    map<ApiFamily|MantleEntry>? overrides = config.routeOverrides;
-    if overrides is map<ApiFamily|MantleEntry> {
-        ApiFamily|MantleEntry? ov = overrides[bareId];
-        if ov is MantleEntry {
-            return mantleRoute(bareId, geoPrefix, region, partition, ov);
-        }
-        if ov is ApiFamily {
-            return buildBareRoute(ov, bareId, geoPrefix, region, partition, config);
-        }
-    }
-
-    // step 4: AUTO preference order MANTLE → CONVERSE → INVOKE (Amendment 2). A
+    // step 2: AUTO preference order MANTLE → CONVERSE → INVOKE. A
     // Mantle-capable model prefers Mantle; membership in MANTLE_CAPABLE means we hold
-    // a verified path/auth/codec for it, so this is still table-driven — an unknown
+    // a verified path/auth/converter for it, so this is still table-driven — an unknown
     // model is absent from the table and sinks to Converse, never Mantle by
-    // elimination (principle 2 survives; only the preference for the KNOWN case flips).
+    // elimination (routing by elimination stays forbidden; only the preference for
+    // the KNOWN case flips).
     //
     // GUARD: only a BARE id prefers Mantle. A CRIS geo prefix (`us.`, `eu.`, ...) is a
     // bedrock-RUNTIME concept — Mantle has no geo prefixes — so a geo-prefixed id
-    // signals cross-region runtime intent and stays on Converse (CLAUDE.md §4:
-    // `us.anthropic.claude-opus-4-8` → Converse with the prefix re-applied).
+    // signals cross-region runtime intent and stays on Converse
+    // (`us.anthropic.claude-opus-4-8` → Converse with the prefix re-applied).
     if geoPrefix is () {
         MantleEntry? entry = MANTLE_CAPABLE[bareId];
         if entry is MantleEntry {
@@ -155,23 +148,17 @@ isolated function resolveBareId(string id, string region, string partition, Rout
         }
     }
 
-    // steps 5-6: everything else (and every geo-prefixed id) → CONVERSE.
-    return buildBareRoute(CONVERSE, bareId, geoPrefix, region, partition, config);
+    // step 3: everything else (and every geo-prefixed id) → CONVERSE.
+    return buildBareRoute(CONVERSE, bareId, geoPrefix, region, partition);
 }
 
 // Builds a CONVERSE/INVOKE/MANTLE route from a resolved family + bare id.
-isolated function buildBareRoute(ApiFamily family, string bareId, string? geoPrefix, string region,
-        string partition, RouteConfig config) returns Route|error {
+isolated function buildBareRoute(RouteFamily family, string bareId, string? geoPrefix, string region,
+        string partition) returns Route|error {
     if family == MANTLE {
-        // `mantleEntryFor` (override-aware), NOT `mantleEntryForBare`: forcing Mantle
-        // via `apiFamily = MANTLE` or a `mantle/` prefix arrives here, and those are
-        // exactly the cases where a caller supplies `routeOverrides` for a model AWS
-        // shipped after our last release (§5.1 step 1/3, §7.3). Consulting only the
-        // static table discarded the override and errored "not available on Mantle"
-        // — breaking the escape hatch precisely when it was needed.
-        return mantleRoute(bareId, geoPrefix, region, partition, check mantleEntryFor(bareId, config));
+        return mantleRoute(bareId, geoPrefix, region, partition, check mantleEntryForBare(bareId));
     }
-    // CONVERSE/INVOKE take the CRIS-prefixed id on the wire (design §5.3).
+    // CONVERSE/INVOKE take the CRIS-prefixed id on the wire.
     return {
         family,
         bareModelId: bareId,
@@ -184,7 +171,7 @@ isolated function buildBareRoute(ApiFamily family, string bareId, string? geoPre
 }
 
 // Builds a MANTLE route. Mantle takes the BARE id on the wire — never the CRIS
-// geo prefix (design §5.3) — unless the entry names a different Mantle-side id.
+// geo prefix — unless the entry names a different Mantle-side id.
 isolated function mantleRoute(string bareId, string? geoPrefix, string region, string partition,
         MantleEntry entry) returns Route {
     return {
@@ -200,32 +187,22 @@ isolated function mantleRoute(string bareId, string? geoPrefix, string region, s
     };
 }
 
-// MANTLE_CAPABLE lookup for a bare id (design §7.3). Capability ≠ membership: a
-// model the user forced onto Mantle must have a path/auth/codec entry.
+// MANTLE_CAPABLE lookup for a bare id. Capability ≠ membership: a
+// model the user forced onto Mantle must have a path entry, because a Mantle path
+// is not derivable from the model id. A model AWS has added since our last release
+// therefore cannot be forced onto Mantle until the table ships it.
 isolated function mantleEntryForBare(string bareId) returns MantleEntry|error {
     MantleEntry? entry = MANTLE_CAPABLE[bareId];
     if entry is () {
-        return error(string `model '${bareId}' is not available on Mantle ` +
-            string `(no path/auth/codec entry); supply 'routeOverrides' if AWS has since added it`);
+        return error(string `model '${bareId}' is not available on Mantle (no known request path). ` +
+            string `Use 'apiFamily = CONVERSE' or 'INVOKE', or upgrade the module if AWS has since ` +
+            string `added it to bedrock-mantle`);
     }
     return entry;
 }
 
-// MANTLE_CAPABLE lookup that also consults `routeOverrides` (for keys — e.g. ARN
-// strings — not present in the static table).
-isolated function mantleEntryFor(string key, RouteConfig config) returns MantleEntry|error {
-    map<ApiFamily|MantleEntry>? overrides = config.routeOverrides;
-    if overrides is map<ApiFamily|MantleEntry> {
-        ApiFamily|MantleEntry? ov = overrides[key];
-        if ov is MantleEntry {
-            return ov;
-        }
-    }
-    return mantleEntryForBare(key);
-}
-
-// Strips a CRIS geo prefix for lookup, keeping it for per-family re-application
-// (design §5.3). Returns [bareId, geoPrefix?].
+// Strips a CRIS geo prefix for lookup, keeping it for per-family re-application.
+// Returns [bareId, geoPrefix?].
 isolated function normalizeModelId(string id) returns [string, string?] {
     int? dot = id.indexOf(".");
     if dot is int {
@@ -237,11 +214,11 @@ isolated function normalizeModelId(string id) returns [string, string?] {
     return [id, ()];
 }
 
-// Re-applies a CRIS geo prefix to a bare id (Converse/Invoke wire form — §5.3).
+// Re-applies a CRIS geo prefix to a bare id (Converse/Invoke wire form).
 isolated function applyGeoPrefix(string bareId, string? geoPrefix) returns string
     => geoPrefix is string ? string `${geoPrefix}.${bareId}` : bareId;
 
-// Partition inferred from a region string (design §9.2). ARNs carry their own
+// Partition inferred from a region string. ARNs carry their own
 // partition; bare-id routes derive it here.
 isolated function partitionForRegion(string region) returns string {
     if region.startsWith("us-gov-") {

@@ -13,8 +13,9 @@
 // limitations under the License.
 
 import ballerina/ai;
+import ballerinax/aws.auth;
 
-// CohereEmbeddingProvider (CLAUDE.md §3; embedding design §6, §7, §8).
+// CohereEmbeddingProvider.
 
 const string COHERE_EMBED_PREFIX = "cohere.embed";
 
@@ -25,7 +26,7 @@ const string COHERE_EMBED_PREFIX = "cohere.embed";
 # it per call — so it is fixed at construction. Embed your corpus with
 # `SEARCH_DOCUMENT` and your queries with `SEARCH_QUERY`, constructing one provider
 # per role. Getting it backwards degrades retrieval **silently** — no error, just
-# worse results (embedding design §6).
+# worse results.
 #
 # ```ballerina
 # final ai:EmbeddingProvider ingest = check new CohereEmbeddingProvider(
@@ -37,35 +38,50 @@ public distinct isolated client class CohereEmbeddingProvider {
     *ai:EmbeddingProvider;
 
     private final string wireModelId;
-    private final readonly & EmbeddingCodec codec;
+    private final readonly & EmbeddingConverter converter;
     private final BedrockTransport transport;
     private final readonly & EmbeddingParams params;
 
-    # + credentials - Static keys, STS, or a Bedrock API key (§9.5)
     # + model - A Cohere Embed id, or a raw id for a model AWS ships before we update the enum
-    # + region - The AWS region
+    # + credentials - Defaults to the full AWS credential chain (env vars, EKS IRSA,
+    #                 SSO, shared config, `credential_process`, ECS container credentials,
+    #                 EC2 IMDSv2), so nothing needs configuring on AWS compute. Pass an
+    #                 `auth:StaticAuthConfig`, `auth:AssumeRoleConfig`, ... for an explicit
+    #                 source, or a `BearerToken` for a Bedrock API key
+    # + region - Defaults to AWS_REGION/AWS_DEFAULT_REGION. Also the SigV4 signing scope, which a custom
+    #            `serviceUrl` does NOT change
+    # + serviceUrl - Endpoint origin. Embeddings are InvokeModel-only, so the default
+    #                template resolves to `bedrock-runtime.{region}.{domain}` from AWS
+    #                SDK endpoint metadata. Override it only for a host AWS cannot
+    #                derive: `https://vpce-0abc123.bedrock-runtime.us-east-1.vpce.amazonaws.com`
+    #                (PrivateLink / VPC endpoint), `https://bedrock-gw.internal.corp`
+    #                (an egress gateway), or `http://localhost:4566` (LocalStack or a
+    #                mock). The `{endpoint}`, `{region}` and `{domain}` placeholders are
+    #                substituted. It replaces the ORIGIN only and never changes the
+    #                SigV4 signing scope. For FIPS use `config.fips`
     # + config - `inputType` (**see the class docs**), `truncate`, `dimensions`, retry, HTTP settings
     # + return - `nil` on success; otherwise an `ai:Error`
     public isolated function init(
-            @display {label: "AWS Credentials"} BedrockCredentials credentials,
             @display {label: "Model"} CohereEmbeddingModel|string model,
-            @display {label: "Region"} string region,
+            @display {label: "AWS Credentials"} BedrockCredentials credentials = auth:DEFAULT_CREDENTIALS,
+            @display {label: "Region"} string region = defaultRegion(),
+            @display {label: "Service URL"} string serviceUrl = DEFAULT_SERVICE_URL,
             @display {label: "Embedding Configuration"} *CohereEmbeddingConfig config)
             returns ai:Error? {
         [string, BedrockTransport] [wireModelId, transport] =
-            check resolveEmbeddingSpine("CohereEmbeddingProvider", credentials, model, region,
-                COHERE_EMBED_PREFIX, COHERE_EMBED_ENGLISH_V3, config?.signingServiceName,
-                config?.httpConfig, config?.retryConfig);
+            check resolveEmbeddingSpine("CohereEmbeddingProvider", credentials, model, region, serviceUrl,
+                COHERE_EMBED_PREFIX, COHERE_EMBED_ENGLISH_V3,
+                config?.httpConfig, config?.retryConfig, config.fips);
 
         self.wireModelId = wireModelId;
         // Two request shapes under one vendor prefix; the id is the only
-        // discriminator (see codec_embed_cohere.bal).
+        // discriminator (see converter_embed_cohere.bal).
         boolean isV4 = usesCohereEmbedV4(wireModelId);
-        self.codec = isV4 ? COHERE_EMBED_V4_CODEC : COHERE_EMBED_V3_CODEC;
+        self.converter = isV4 ? COHERE_EMBED_V4_CONVERTER : COHERE_EMBED_V3_CONVERTER;
         self.transport = transport;
 
         // `inputType` always has a value (defaults to SEARCH_DOCUMENT) — Cohere
-        // requires it on every request (§6).
+        // requires it on every request.
         EmbeddingParams params = {inputType: config.inputType};
         Truncate? truncate = config?.truncate;
         if truncate is Truncate {
@@ -73,7 +89,7 @@ public distinct isolated client class CohereEmbeddingProvider {
         }
         int? dimensions = config?.dimensions;
         if dimensions is int {
-            // Fail at construction, not per call (embedding design §8). Silently
+            // Fail at construction, not per call. Silently
             // dropping this would be worse than a 400: the caller would index a
             // corpus at the wrong width and only discover it at query time.
             if !isV4 {
@@ -88,7 +104,7 @@ public distinct isolated client class CohereEmbeddingProvider {
             }
             params.dimensions = dimensions;
         }
-        json additional = config?.additionalModelRequestFields;
+        AdditionalRequestFields? additional = config?.additionalModelRequestFields;
         if additional != () {
             params.additionalModelRequestFields = additional;
         }
@@ -100,13 +116,13 @@ public distinct isolated client class CohereEmbeddingProvider {
     # + chunk - The chunk to convert; must be an `ai:TextChunk` or `ai:TextDocument`
     # + return - The embedding vector, or an `ai:Error`
     isolated remote function embed(ai:Chunk chunk) returns ai:Embedding|ai:Error
-        => runEmbed("Cohere", self.wireModelId, self.codec, self.transport, self.params, chunk);
+        => runEmbed("Cohere", self.wireModelId, self.converter, self.transport, self.params, chunk);
 
     # Converts a batch of chunks into vector embeddings, preserving input order.
-    # Batches of up to 96 texts per request (embedding design §7).
+    # Batches of up to 96 texts per request.
     #
     # + chunks - The chunks to convert; each must be an `ai:TextChunk` or `ai:TextDocument`
     # + return - The embeddings in input order, or an `ai:Error`
     isolated remote function batchEmbed(ai:Chunk[] chunks) returns ai:Embedding[]|ai:Error
-        => runBatchEmbed("Cohere", self.wireModelId, self.codec, self.transport, self.params, chunks);
+        => runBatchEmbed("Cohere", self.wireModelId, self.converter, self.transport, self.params, chunks);
 }

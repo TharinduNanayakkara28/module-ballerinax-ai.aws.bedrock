@@ -57,6 +57,13 @@ import static io.ballerina.runtime.api.creators.ValueCreator.createMapValue;
  * {@code ai:ModelProvider} interface). This class reads that annotation and derives
  * schemas structurally for arrays, unions and simple types.
  *
+ * <p>This step is AUTHORITATIVE: it either returns a schema or raises an
+ * {@code ai:Error}, and never defers to a Ballerina-side fallback. It covers a strict
+ * superset of what a pure-Ballerina implementation can express (recursive arrays and
+ * unions, not just simple types and simple-member arrays), so a "generated at compile
+ * time" flag gating a fallback would never fire — the fallback and its flag were
+ * removed rather than left as unreachable code that reads like a safety net.
+ *
  * @since 0.1.0
  */
 public final class Native {
@@ -68,17 +75,14 @@ public final class Native {
     }
 
     public static Object generateJsonSchemaForTypedescNative(BTypedesc td) {
-        SchemaGenerationContext schemaGenerationContext = new SchemaGenerationContext();
         try {
-            Object schema = generateJsonSchemaForType(td.getDescribingType(), schemaGenerationContext);
-            return schemaGenerationContext.isSchemaGeneratedAtCompileTime ? schema : null;
+            return generateJsonSchemaForType(td.getDescribingType());
         } catch (BError e) {
             return createAIError(e.getErrorMessage());
         }
     }
 
-    private static Object generateJsonSchemaForType(Type t, SchemaGenerationContext schemaGenerationContext)
-            throws BError {
+    private static Object generateJsonSchemaForType(Type t) throws BError {
         Type impliedType = TypeUtils.getImpliedType(t);
         if (isSimpleType(impliedType)) {
             return createSimpleTypeSchema(impliedType);
@@ -86,10 +90,9 @@ public final class Native {
 
         return switch (impliedType) {
             case JsonType ignored -> generateJsonSchemaForJson();
-            case ArrayType arrayType -> generateJsonSchemaForArrayType(arrayType, schemaGenerationContext);
-            case UnionType unionType -> generateUnionTypeSchema(unionType, schemaGenerationContext);
-            case ReferenceType referenceType -> getJsonSchemaFromAnnotatableType(referenceType,
-                    schemaGenerationContext);
+            case ArrayType arrayType -> generateJsonSchemaForArrayType(arrayType);
+            case UnionType unionType -> generateUnionTypeSchema(unionType);
+            case ReferenceType referenceType -> getJsonSchemaFromAnnotatableType(referenceType);
             default -> throw ErrorCreator.createError(StringUtils.fromString(
                     "Runtime schema generation is not yet supported for type " + impliedType.getName()));
         };
@@ -106,14 +109,13 @@ public final class Native {
         return schemaMap;
     }
 
-    private static Object generateUnionTypeSchema(UnionType unionType,
-                                                  SchemaGenerationContext schemaGenerationContext) {
+    private static Object generateUnionTypeSchema(UnionType unionType) {
         BMap<BString, Object> schemaMap = createMapValue(TypeCreator.createMapType(PredefinedTypes.TYPE_JSON));
         List<Type> memberTypes = unionType.getMemberTypes();
         BArray schemas = ValueCreator.createArrayValue(
                 TypeCreator.createArrayType(PredefinedTypes.TYPE_JSON));
         for (Type memberType : memberTypes) {
-            Object schema = generateJsonSchemaForType(memberType, schemaGenerationContext);
+            Object schema = generateJsonSchemaForType(memberType);
             schemas.append(schema);
         }
         if (schemas.size() == 1) {
@@ -123,8 +125,7 @@ public final class Native {
         return schemaMap;
     }
 
-    private static Object getJsonSchemaFromAnnotatableType(ReferenceType referenceType,
-                                                           SchemaGenerationContext schemaGenerationContext) {
+    private static Object getJsonSchemaFromAnnotatableType(ReferenceType referenceType) {
         Type referredType = referenceType.getReferredType();
         if (referredType instanceof AnnotatableType annotatableType) {
             BMap<BString, Object> annotations = annotatableType.getAnnotations();
@@ -179,26 +180,11 @@ public final class Native {
         };
     }
 
-    private static Object generateJsonSchemaForArrayType(ArrayType arrayType,
-                                                         SchemaGenerationContext schemaGenerationContext) {
+    private static Object generateJsonSchemaForArrayType(ArrayType arrayType) {
         BMap<BString, Object> schemaMap = createMapValue(TypeCreator.createMapType(PredefinedTypes.TYPE_JSON));
         Type elementType = TypeUtils.getImpliedType(arrayType.getElementType());
         schemaMap.put(StringUtils.fromString("type"), StringUtils.fromString("array"));
-        schemaMap.put(StringUtils.fromString("items"), generateJsonSchemaForType(elementType,
-                schemaGenerationContext));
+        schemaMap.put(StringUtils.fromString("items"), generateJsonSchemaForType(elementType));
         return schemaMap;
-    }
-
-    public static BTypedesc getArrayMemberType(BTypedesc expectedResponseTypedesc) {
-        return ValueCreator.createTypedescValue(
-                ((ArrayType) TypeUtils.getImpliedType(expectedResponseTypedesc.getDescribingType())).getElementType());
-    }
-
-    public static boolean containsNil(BTypedesc expectedResponseTypedesc) {
-        return expectedResponseTypedesc.getDescribingType().isNilable();
-    }
-
-    private static class SchemaGenerationContext {
-        boolean isSchemaGeneratedAtCompileTime = true;
     }
 }

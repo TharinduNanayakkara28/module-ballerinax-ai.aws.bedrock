@@ -14,7 +14,7 @@
 
 import ballerina/test;
 
-// Table tests on the pure resolver (design §13.1). No AWS credentials needed.
+// Table tests on the pure resolver. No AWS credentials needed.
 
 const REGION = "us-east-1";
 
@@ -23,7 +23,7 @@ const REGION = "us-east-1";
 @test:Config {}
 function testBareIdResolvesToConverse() returns error? {
     // nova-pro is Converse-default (not Mantle-capable). opus-4-8 now prefers Mantle
-    // under AUTO (Amendment 2), so a Converse-clean-fields assertion needs a model
+    // under AUTO, so a Converse-clean-fields assertion needs a model
     // that genuinely defaults to Converse.
     Route r = check resolveRoute("amazon.nova-pro-v1:0", REGION);
     test:assertEquals(r.family, CONVERSE);
@@ -36,7 +36,7 @@ function testBareIdResolvesToConverse() returns error? {
 
 @test:Config {}
 function testCrisPrefixStrippedForLookupAndReappliedOnWire() returns error? {
-    // §5.3: the correct runtime id must resolve, and the prefix must survive to the wire.
+    // the correct runtime id must resolve, and the prefix must survive to the wire.
     Route r = check resolveRoute("us.anthropic.claude-opus-4-8", REGION);
     test:assertEquals(r.family, CONVERSE);
     test:assertEquals(r.bareModelId, "anthropic.claude-opus-4-8", "prefix must be stripped for lookup");
@@ -54,7 +54,7 @@ function testGlobalPrefixNormalization() returns error? {
 
 @test:Config {}
 function testUnknownBareModelSinksToConverseNeverMantle() returns error? {
-    // The fallback trap (design principle 2, §11): absence from a map is not evidence of Mantle.
+    // The fallback trap: absence from a map is not evidence of Mantle.
     Route r = check resolveRoute("acme.brand-new-model-v9", REGION);
     test:assertEquals(r.family, CONVERSE);
     test:assertNotEquals(r.family, MANTLE);
@@ -70,8 +70,8 @@ function testMantleOnlyModelDefaultsToMantle() returns error? {
     test:assertEquals(r.effectiveModelId, "openai.gpt-5.4", "Mantle takes the bare id on the wire");
     MantleEntry entry = check r.mantleEntry.ensureType();
     test:assertEquals(entry.path, "/openai/v1/responses");
-    test:assertEquals(entry.authHeader, BEARER);
-    test:assertEquals(entry.codec, RESPONSES_CODEC);
+    test:assertFalse(usesApiKeyHeader(entry.path));
+    test:assertEquals((check mantleConverterForPath(entry.path)).toolChoice, RESPONSES_TOOL_CHOICE);
 }
 
 @test:Config {}
@@ -80,15 +80,15 @@ function testMythosDefaultsToMantleWithMessagesPath() returns error? {
     test:assertEquals(r.family, MANTLE);
     MantleEntry entry = check r.mantleEntry.ensureType();
     test:assertEquals(entry.path, "/anthropic/v1/messages");
-    test:assertEquals(entry.authHeader, X_API_KEY);
-    test:assertEquals(entry.codec, MESSAGES_CODEC);
+    test:assertTrue(usesApiKeyHeader(entry.path));
+    test:assertEquals((check mantleConverterForPath(entry.path)).toolChoice, ANTHROPIC_TOOL_CHOICE);
 }
 
 // ---- explicit overrides ----
 
 @test:Config {}
 function testForceMantleOnDualEndpointModelResolvesViaCapable() returns error? {
-    // §7.3: capability, not membership — a dual-endpoint model forced to Mantle must resolve.
+    // capability, not membership — a dual-endpoint model forced to Mantle must resolve.
     Route r = check resolveRoute("anthropic.claude-haiku-4-5", REGION, {apiFamily: MANTLE});
     test:assertEquals(r.family, MANTLE);
     MantleEntry entry = check r.mantleEntry.ensureType();
@@ -97,7 +97,7 @@ function testForceMantleOnDualEndpointModelResolvesViaCapable() returns error? {
 
 @test:Config {}
 function testForceMantleOnConverseOnlyModelErrors() {
-    // §7.3: not Mantle-capable → clean construction error, not a hard 400 later.
+    // not Mantle-capable → clean construction error, not a hard 400 later.
     //
     // This previously used `anthropic.claude-opus-4-8` as the example — but that
     // model's card says `bedrock-mantle: YES`, so the assertion was false and only
@@ -119,25 +119,10 @@ function testMantlePrefixOverride() returns error? {
 
 @test:Config {}
 function testConversePrefixOverridesMantleDefault() returns error? {
-    // Explicit override outranks the Mantle default (design principle 4, §5.1 step 1).
+    // Explicit override outranks the Mantle default.
     Route r = check resolveRoute("converse/openai.gpt-5.4", REGION);
     test:assertEquals(r.family, CONVERSE);
     test:assertEquals(r.effectiveModelId, "openai.gpt-5.4");
-}
-
-@test:Config {}
-function testRouteOverrideToMantleEntry() returns error? {
-    MantleEntry newEntry = {path: "/openai/v1/responses", authHeader: BEARER, codec: RESPONSES_CODEC};
-    Route r = check resolveRoute("openai.gpt-6", REGION, {routeOverrides: {"openai.gpt-6": newEntry}});
-    test:assertEquals(r.family, MANTLE);
-    MantleEntry entry = check r.mantleEntry.ensureType();
-    test:assertEquals(entry.path, "/openai/v1/responses");
-}
-
-@test:Config {}
-function testRouteOverrideToConverse() returns error? {
-    Route r = check resolveRoute("newvendor.some-model", REGION, {routeOverrides: {"newvendor.some-model": INVOKE}});
-    test:assertEquals(r.family, INVOKE);
 }
 
 // ---- ARN dispatch ----
@@ -148,29 +133,20 @@ function testFoundationModelArnStripsToBareId() returns error? {
         "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-6", REGION);
     test:assertEquals(r.family, CONVERSE);
     test:assertEquals(r.bareModelId, "anthropic.claude-sonnet-4-6");
-    test:assertEquals(r.region, "us-west-2", "ARN region overrides config.region (§5.2)");
+    test:assertEquals(r.region, "us-west-2", "ARN region overrides config.region");
 }
 
 @test:Config {}
-function testImportedModelArnWithoutSchemaErrors() {
+function testImportedModelArnIsRefusedByName() {
+    // Custom Model Import is out of scope: AWS applies no default chat template to
+    // imported weights, so no request body can be built without the caller naming the
+    // dialect. Refuse at construction rather than fail opaquely on the wire.
     Route|error r = resolveRoute(
         "arn:aws:bedrock:us-west-2:123456789012:imported-model/abc123def456", REGION);
     test:assertTrue(r is error);
     if r is error {
-        test:assertTrue(r.message().includes("modelSchema"), r.message());
+        test:assertTrue(r.message().includes("imported-model"), r.message());
     }
-}
-
-@test:Config {}
-function testImportedModelArnWithSchemaResolvesToInvoke() returns error? {
-    Route r = check resolveRoute(
-        "arn:aws:bedrock:us-west-2:123456789012:imported-model/abc123def456", REGION,
-        {modelSchema: LLAMA});
-    test:assertEquals(r.family, INVOKE);
-    test:assertEquals(r.effectiveModelId,
-        "arn:aws:bedrock:us-west-2:123456789012:imported-model/abc123def456",
-        "opaque ARN goes on the wire verbatim");
-    test:assertEquals(r.region, "us-west-2");
 }
 
 @test:Config {}
@@ -204,7 +180,7 @@ function testApplicationInferenceProfileArnResolvesToConverse() returns error? {
 
 @test:Config {}
 function testCustomModelArnErrors() {
-    // §5.2 policy choice: artifact, not a deployment.
+    // Policy choice: artifact, not a deployment.
     Route|error r = resolveRoute(
         "arn:aws:bedrock:us-east-1:123456789012:custom-model/mymodel", REGION);
     test:assertTrue(r is error);
@@ -239,7 +215,7 @@ function testChinaPartitionArnBuildsTheCnHostAndSignsAsBedrock() returns error? 
 
 @test:Config {}
 function testMantleIsRejectedOnTheChinaPartitionBeforeAnyIo() {
-    // The `api.aws` Mantle host is not partition-templated (§9.2), so this must be
+    // The `api.aws` Mantle host is not partition-templated, so this must be
     // a construction error rather than a request to a host that cannot exist.
     // Rejection may land in either stage, so BOTH branches assert — an `if r is
     // Route` wrapper alone would let the test pass without running one assertion
@@ -308,13 +284,13 @@ function testNormalizeModelIdKeepsNonCrisDotPrefix() {
     test:assertEquals(geoPrefix, ());
 }
 
-// ---- Mantle escape hatch for dual-endpoint models (design §7.3) ----
+// ---- Mantle escape hatch for dual-endpoint models ----
 
 @test:Config {}
 function testDualHomedModelCanBeForcedOntoMantle() returns error? {
     // REGRESSION: MANTLE_CAPABLE held only Mantle-only models, so forcing Mantle on
     // a dual-endpoint model errored "not available on Mantle" — which its own card
-    // contradicts. §7.3 says the table must list every Mantle-capable model.
+    // contradicts. The table must list every Mantle-capable model.
     // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-8.html
     Route forced = check resolveRoute("anthropic.claude-opus-4-8", REGION, {apiFamily: MANTLE});
     test:assertEquals(forced.family, MANTLE);
@@ -326,7 +302,7 @@ function testDualHomedModelCanBeForcedOntoMantle() returns error? {
     Route prefixed = check resolveRoute("mantle/anthropic.claude-opus-4-8", REGION);
     test:assertEquals(prefixed.family, MANTLE);
 
-    // Under Amendment 2 it also DEFAULTS to Mantle under AUTO (Mantle-capable →
+    // It also DEFAULTS to Mantle under AUTO (Mantle-capable →
     // Mantle); `converse/` (or apiFamily=CONVERSE) is needed for the runtime surface.
     Route auto = check resolveRoute("anthropic.claude-opus-4-8", REGION);
     test:assertEquals(auto.family, MANTLE);
@@ -346,28 +322,10 @@ function testMantleUsesItsOwnModelIdWhenTheEndpointsDisagree() returns error? {
     test:assertEquals(mantle.bareModelId, "openai.gpt-oss-120b-1:0", "the lookup key stays the runtime id");
 
     // The runtime routes keep the `-1:0` id. gpt-oss is Mantle-capable, so it now
-    // prefers Mantle under AUTO (Amendment 2) — force CONVERSE for the runtime form.
+    // prefers Mantle under AUTO — force CONVERSE for the runtime form.
     Route converse = check resolveRoute("openai.gpt-oss-120b-1:0", REGION, {apiFamily: CONVERSE});
     test:assertEquals(converse.family, CONVERSE);
     test:assertEquals(converse.effectiveModelId, "openai.gpt-oss-120b-1:0");
-}
-
-@test:Config {}
-function testForcedMantleHonoursRouteOverrides() returns error? {
-    // REGRESSION: forcing MANTLE consulted only the static table and discarded the
-    // caller's routeOverrides — breaking the "AWS shipped a model, no release
-    // needed" hatch in exactly the case it exists for (§5.1 step 1/3, §7.3).
-    MantleEntry entry = {path: "/openai/v1/responses", authHeader: BEARER, codec: RESPONSES_CODEC};
-    RouteConfig config = {apiFamily: MANTLE, routeOverrides: {"openai.gpt-6": entry}};
-    Route route = check resolveRoute("openai.gpt-6", REGION, config);
-    test:assertEquals(route.family, MANTLE);
-    Endpoint ep = check buildEndpoint(route);
-    test:assertEquals(ep.path, "/openai/v1/responses");
-
-    // The `mantle/` prefix form must honour it too.
-    Route prefixed = check resolveRoute("mantle/openai.gpt-6", REGION, {routeOverrides: {"openai.gpt-6": entry}});
-    test:assertEquals(prefixed.family, MANTLE);
-    test:assertEquals((check buildEndpoint(prefixed)).path, "/openai/v1/responses");
 }
 
 @test:Config {}
@@ -397,7 +355,7 @@ function testArnRegionStillOverridesTheCallerRegionWhenPresent() returns error? 
     Route r = check resolveRoute(
         "arn:aws:bedrock:ap-northeast-1:123456789012:inference-profile/apac.anthropic.claude-sonnet-4-6",
         "us-east-1");
-    test:assertEquals(r.region, "ap-northeast-1", "a present ARN region stays authoritative (§5.2)");
+    test:assertEquals(r.region, "ap-northeast-1", "a present ARN region stays authoritative");
 }
 
 @test:Config {}

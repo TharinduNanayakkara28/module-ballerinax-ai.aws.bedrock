@@ -15,14 +15,14 @@
 import ballerina/ai;
 import ballerina/test;
 
-// Vendor facades + the CLAUDE.md design amendments (AUTO routing, no Tier-2,
+// Vendor facades: AUTO routing, no Tier-2,
 // per-model supportsStructuredOutput).
 
-// ---- amendment: ApiFamily.AUTO ----
+// ---- ApiFamily.AUTO ----
 
 @test:Config {}
 function testAutoIsTheDefaultAndRunsTheResolver() returns error? {
-    // AUTO must behave exactly like "no forced family" (amendment). Under Amendment 2
+    // AUTO must behave exactly like "no forced family". By default
     // the resolver prefers Mantle for a Mantle-capable model, so opus-4-8 → Mantle;
     // the point of this test is that AUTO and "no family" agree.
     Route auto = check resolveRoute("anthropic.claude-opus-4-8", REGION, {apiFamily: AUTO});
@@ -43,18 +43,18 @@ function testForcingInvokeOverridesTheResolver() returns error? {
     test:assertEquals(route.family, INVOKE);
 }
 
-// ---- amendment: supportsStructuredOutput ----
+// ---- supportsStructuredOutput ----
 
 @test:Config {}
 function testMantleRejectsTypedStructuredOutput() returns error? {
     // Mantle has no structured-output path: a non-string target must fail clean.
     Route route = check resolveRoute("anthropic.claude-mythos-preview", "us-east-1");
     Endpoint ep = check buildEndpoint(route);
-    readonly & ModelCodec codec = check selectCodec(route);
+    readonly & ModelConverter converter = check selectConverter(route);
     BedrockTransport transport = check new (TEST_CREDS, route.region, ep);
     ai:Prompt prompt = `Give me a number`;
 
-    anydata|ai:Error result = structuredGenerate(false, MANTLE, codec, transport,
+    anydata|ai:Error result = structuredGenerate(false, MANTLE, converter, transport,
         route.effectiveModelId, {}, {temperature: 0.5d, maxTokens: 16}, prompt, int);
     test:assertTrue(result is ai:Error);
     if result is ai:Error {
@@ -73,14 +73,14 @@ function testConverseRouteSupportsStructuredOutputFlag() returns error? {
     test:assertTrue(mantle.family == MANTLE, "Mantle route → structured output unsupported");
 }
 
-// ---- Nova Invoke: the schemaVersion landmine (design §7.2, §13.2) ----
+// ---- Nova Invoke: the schemaVersion landmine ----
 
 @test:Config {}
 function testNovaInvokeEmitsSchemaVersion() returns error? {
     InferenceParams params = {temperature: 0.5d, maxTokens: 100};
     map<json> body = check encodeNovaInvoke(SAMPLE_SYSTEM, SAMPLE_MESSAGES, [], (), params).ensureType();
-    test:assertEquals(body["schemaVersion"], "messages-v1", "§7.2: omit it and Nova fails validation");
-    test:assertTrue(body.hasKey("system"), "system is top-level, not a message (§7.1)");
+    test:assertEquals(body["schemaVersion"], "messages-v1", "omit it and Nova fails validation");
+    test:assertTrue(body.hasKey("system"), "system is top-level, not a message");
     test:assertFalse(body.hasKey("anthropic_version"), "Nova must not carry the Anthropic body field");
 }
 
@@ -97,7 +97,7 @@ function testNovaDecodeSharesConverseShape() returns error? {
     test:assertEquals(decoded.stopReason, "end_turn");
 }
 
-// ---- OpenAI chat codec ----
+// ---- OpenAI chat converter ----
 
 @test:Config {}
 function testOpenAIChatEmitsSystemAsMessageRole() returns error? {
@@ -125,7 +125,7 @@ function testOpenAIChatDecodePopulatesUsageAndStopReason() returns error? {
     test:assertEquals(decoded.responseId, "chatcmpl-1");
 }
 
-// ---- Mantle Responses codec (GPT-5.x) ----
+// ---- Mantle Responses converter (GPT-5.x) ----
 
 @test:Config {}
 function testResponsesDecodePopulatesUsageAndStopReason() returns error? {
@@ -156,14 +156,14 @@ function testResponsesEncodesSystemAsInstructions() returns error? {
 @test:Config {}
 function testAllVendorProvidersConstruct() returns error? {
     // Smoke test: every vendor facade constructs (no I/O). Note routing varies —
-    // qwen3-32b and gpt-oss now resolve to Mantle under AUTO (Amendment 2) — but
+    // qwen3-32b and gpt-oss now resolve to Mantle under AUTO — but
     // construction succeeds on any route.
-    AmazonModelProvider amazon = check new (TEST_CREDS, "amazon.nova-pro-v1:0", REGION);
-    MistralModelProvider mistral = check new (TEST_CREDS, "mistral.mistral-large-2407-v1:0", REGION);
-    QwenModelProvider qwen = check new (TEST_CREDS, "qwen.qwen3-32b-v1:0", REGION);
-    GoogleModelProvider google = check new (TEST_CREDS, "google.gemma-3-27b-it", REGION);
-    DeepSeekModelProvider deepseek = check new (TEST_CREDS, "us.deepseek.r1-v1:0", REGION);
-    OpenAIModelProvider openai = check new (TEST_CREDS, "openai.gpt-oss-120b-1:0", REGION);
+    AmazonModelProvider amazon = check new ("amazon.nova-pro-v1:0", TEST_CREDS, REGION);
+    MistralModelProvider mistral = check new ("mistral.mistral-large-2407-v1:0", TEST_CREDS, REGION);
+    QwenModelProvider qwen = check new ("qwen.qwen3-32b-v1:0", TEST_CREDS, REGION);
+    GoogleModelProvider google = check new ("google.gemma-3-27b-it", TEST_CREDS, REGION);
+    DeepSeekModelProvider deepseek = check new ("us.deepseek.r1-v1:0", TEST_CREDS, REGION);
+    OpenAIModelProvider openai = check new ("openai.gpt-oss-120b-1:0", TEST_CREDS, REGION);
     test:assertTrue(amazon is AmazonModelProvider);
     test:assertTrue(mistral is MistralModelProvider);
     test:assertTrue(qwen is QwenModelProvider);
@@ -174,7 +174,7 @@ function testAllVendorProvidersConstruct() returns error? {
 
 @test:Config {}
 function testOpenAIMantleOnlyModelResolvesToMantleResponses() returns error? {
-    // GPT-5.4 exists only on Mantle — the reason this module exists (design §1).
+    // GPT-5.4 exists only on Mantle — the reason this module exists.
     Route route = check resolveRoute("openai.gpt-5.4", REGION);
     test:assertEquals(route.family, MANTLE);
     Endpoint ep = check buildEndpoint(route);
@@ -184,7 +184,7 @@ function testOpenAIMantleOnlyModelResolvesToMantleResponses() returns error? {
 
 @test:Config {}
 function testGemma3DefaultsToMantleOnItsOwnChatCompletionsPath() returns error? {
-    // Gemma 3 is dual-homed, so under Amendment 2 AUTO prefers Mantle. The point that
+    // Gemma 3 is dual-homed, so under AUTO the resolver prefers Mantle. The point that
     // matters: Gemma 3's Mantle path is `/v1/chat/completions`, DIFFERENT from Gemma
     // 4's `/openai/v1/responses` — one vendor prefix, two Mantle path families.
     // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-google-gemma-3-27b-pt.html
@@ -224,7 +224,7 @@ function testGemma4IsMantleOnlyNotConverse() returns error? {
 @test:Config {}
 function testGemma4CannotDoStructuredOutput() returns error? {
     // Falls out of being Mantle-only: no Converse route means no forced tools.
-    GoogleModelProvider provider = check new (TEST_CREDS, GEMMA_4_31B, REGION);
+    GoogleModelProvider provider = check new (GEMMA_4_31B, TEST_CREDS, REGION);
     LiveFruitShape|ai:Error result = provider->generate(`Name a fruit.`);
     test:assertTrue(result is ai:Error, "Gemma 4 must refuse a typed target (Mantle route)");
 }
@@ -236,7 +236,7 @@ type LiveFruitShape record {|
 @test:Config {}
 function testGptOssModelIdWithColonIsEncodedOnTheWire() returns error? {
     // `openai.gpt-oss-120b-1:0` carries a colon — the SigV4 double-encoding case. It
-    // is Mantle-capable so AUTO now prefers Mantle (Amendment 2); force CONVERSE to
+    // is Mantle-capable so AUTO now prefers Mantle; force CONVERSE to
     // exercise the runtime `/model/{id}` path where the colon lands in the URI.
     Route route = check resolveRoute("openai.gpt-oss-120b-1:0", REGION, {apiFamily: CONVERSE});
     Endpoint ep = check buildEndpoint(route);
@@ -274,8 +274,8 @@ function testAllKnownMantleOnlyModelsResolveToMantle() returns error? {
 
 @test:Config {}
 function testMantleCapableModelsDefaultToMantleUnderAuto() returns error? {
-    // Amendment 2: AUTO prefers MANTLE → CONVERSE → INVOKE, so every model with a
-    // verified MANTLE_CAPABLE entry defaults to Mantle. (Pre-amendment these defaulted
+    // AUTO prefers MANTLE → CONVERSE → INVOKE, so every model with a
+    // verified MANTLE_CAPABLE entry defaults to Mantle. (These previously defaulted
     // to Converse; that assertion is now inverted.)
     foreach string id in ["anthropic.claude-haiku-4-5", "anthropic.claude-opus-4-8", "zai.glm-5",
             "deepseek.v3.2", "mistral.mistral-large-3-675b-instruct", "qwen.qwen3-coder-480b-a35b-v1:0",

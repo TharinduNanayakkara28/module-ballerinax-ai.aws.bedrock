@@ -14,21 +14,21 @@
 
 import ballerina/ai;
 
-// Converse codec — the model-agnostic normalized surface (design §5, §9.3).
+// Converse converter — the model-agnostic normalized surface.
 // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
 
 // Encodes a Converse request body. `system` is the top-level `system` field, never
-// a message (§7.1). Forwards the §9.3 passthrough verbatim.
-isolated function encodeConverse(ai:ChatSystemMessage? system, ai:ChatMessage[] messages,
+// a message. Forwards the passthrough verbatim.
+isolated function encodeConverse(string? system, ResolvedMessage[] messages,
         ai:ChatCompletionFunctions[] tools, string? stop, InferenceParams params) returns json|ai:Error {
     json[] wire = [];
-    foreach ai:ChatMessage m in messages {
+    foreach ResolvedMessage m in messages {
         wire.push(converseMessage(m));
     }
 
     map<json> inferenceConfig = {"maxTokens": params.maxTokens};
     setTemperature(inferenceConfig, params);
-    // Per-call `stop` overrides configured stopSequences outright (design §7).
+    // Per-call `stop` overrides configured stopSequences outright.
     string[]? stops = params.stopSequences;
     if stop is string {
         stops = [stop];
@@ -39,8 +39,8 @@ isolated function encodeConverse(ai:ChatSystemMessage? system, ai:ChatMessage[] 
 
     map<json> body = {"messages": wire, "inferenceConfig": inferenceConfig};
 
-    if system is ai:ChatSystemMessage {
-        body["system"] = [{"text": contentToString(system.content)}]; // §7.1
+    if system is string {
+        body["system"] = [{"text": system}];
     }
     if tools.length() > 0 {
         json[] toolSpecs = [];
@@ -52,18 +52,33 @@ isolated function encodeConverse(ai:ChatSystemMessage? system, ai:ChatMessage[] 
         body["toolConfig"] = {"tools": toolSpecs};
     }
 
-    // ---- §9.3 passthrough — forwarded verbatim; mandatory for top_k/thinking/reasoning ----
-    json additionalRequest = params?.additionalModelRequestFields;
-    if additionalRequest != () {
-        body["additionalModelRequestFields"] = additionalRequest;
+    // ---- passthrough — forwarded verbatim; mandatory for top_k/thinking/reasoning ----
+    // Converse does not model `thinking`, so it rides the passthrough — merged in
+    // rather than overwriting whatever the caller already put there.
+    AdditionalRequestFields? additionalRequest = params?.additionalModelRequestFields;
+    ThinkingConfig? thinking = params?.thinking;
+    if thinking is ThinkingConfig {
+        additionalRequest = foldRequestFields(additionalRequest, {"thinking": thinkingBody(thinking)});
     }
-    string[]? responsePaths = params.additionalModelResponseFieldPaths;
-    if responsePaths is string[] && responsePaths.length() > 0 {
-        body["additionalModelResponseFieldPaths"] = responsePaths;
+    // `effort` rides the passthrough too, not a native `outputConfig` member.
+    //
+    // Two first-party sources disagreed here: botocore models `outputConfig:
+    // {textFormat, effort}` on ConverseRequest, while AWS's adaptive-thinking page
+    // routes it through `additionalModelRequestFields: {"output_config": {"effort":
+    // ...}}`. Live-verified 2026-08-11: the native member 400s on every model tried
+    // (opus-4-8, sonnet-4-6, and — decisively — opus-4-7, which IS on Anthropic's
+    // adaptive-only list, ruling out "wrong model") with "This model doesn't support
+    // the effort field"; the identical value folded into
+    // additionalModelRequestFields.output_config.effort is accepted (opus-4-7,
+    // controlled pair against the same 400). AWS's docs were right; botocore's
+    // modelled member is not honoured on the wire.
+    Effort? effort = params?.effort;
+    if effort is Effort {
+        additionalRequest = foldRequestFields(additionalRequest, {"output_config": {"effort": effort}});
     }
-    map<string>? metadata = params.requestMetadata;
-    if metadata is map<string> {
-        body["requestMetadata"] = metadata;
+    map<json>? additionalJson = additionalFieldsToJson(additionalRequest);
+    if additionalJson != () {
+        body["additionalModelRequestFields"] = additionalJson;
     }
     ServiceTier? tier = params.serviceTier;
     if tier is ServiceTier {
@@ -76,31 +91,27 @@ isolated function encodeConverse(ai:ChatSystemMessage? system, ai:ChatMessage[] 
     if latencyOptimized == true {
         // `"performanceConfig": { "latency": "optimized" }` — an object, like
         // serviceTier. Only `optimized` is worth emitting; `standard` is the default,
-        // so an unset/false flag sends nothing. Support is per model+region (§9.3).
+        // so an unset/false flag sends nothing. Support is per model+region.
         // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
         body["performanceConfig"] = {"latency": "optimized"};
     }
-    // Guardrail is a Converse BODY field (design §9.5).
+    // Guardrail is a Converse BODY field.
     GuardrailConfig? guardrail = params.guardrail;
     if guardrail is GuardrailConfig {
         map<json> gc = {
             "guardrailIdentifier": guardrail.guardrailIdentifier,
             "guardrailVersion": guardrail.guardrailVersion
         };
-        string? trace = guardrail.trace;
-        if trace is string {
-            // Converse guardrailConfig.trace is lowercase (`enabled`|`disabled`).
-            gc["trace"] = trace.toLowerAscii();
-        }
         body["guardrailConfig"] = gc;
     }
     return body;
 }
 
-// Maps one `ai:ChatMessage` to a Converse content block (design §7.1).
-isolated function converseMessage(ai:ChatMessage m) returns json {
-    if m is ai:ChatUserMessage {
-        return {"role": "user", "content": [{"text": contentToString(m.content)}]};
+// Maps one resolved message to a Converse content block. Images ride the native
+// `image` ContentBlock member — verified against the Converse API reference.
+isolated function converseMessage(ResolvedMessage m) returns json {
+    if m is ResolvedUserMessage {
+        return {"role": "user", "content": converseContentBlocks(m.parts)};
     }
     if m is ai:ChatAssistantMessage {
         json[] blocks = [];
@@ -116,19 +127,15 @@ isolated function converseMessage(ai:ChatMessage m) returns json {
         }
         return {"role": "assistant", "content": blocks};
     }
-    if m is ai:ChatFunctionMessage {
-        // ai:FUNCTION result → Converse toolResult block (§7.1).
-        return {
-            "role": "user",
-            "content": [{"toolResult": {"toolUseId": m.id ?: m.name, "content": [{"text": m.content ?: ""}]}}]
-        };
-    }
-    // Defensive: a hoisted-away system message.
-    return {"role": "user", "content": [{"text": contentToString(m.content)}]};
+    // ai:FUNCTION result → Converse toolResult block.
+    return {
+        "role": "user",
+        "content": [{"toolResult": {"toolUseId": m.id ?: m.name, "content": [{"text": m.content ?: ""}]}}]
+    };
 }
 
-// Decodes a Converse response (design §7, §9.5). Always populates `usage` and
-// `stopReason`; maps `guardrail_intervened` to `INTERVENED` (§9.5).
+// Decodes a Converse response. Always populates `usage` and
+// `stopReason`; maps `guardrail_intervened` to `INTERVENED`.
 isolated function decodeConverse(json response) returns DecodedResponse|ai:Error {
     map<json>|error rr = response.ensureType();
     if rr is error {
@@ -183,8 +190,7 @@ isolated function decodeConverse(json response) returns DecodedResponse|ai:Error
         stopReason,
         responseId: (), // Converse returns the request id in a header, not the body
         // Converse reports it via stopReason; Nova-on-Invoke shares this decoder
-        // but reports it as a body field instead, so check both (§9.5).
-        guardrailAction: stopReason == "guardrail_intervened" ? INTERVENED : invokeGuardrailAction(r),
-        additionalModelResponseFields: r["additionalModelResponseFields"]
+        // but reports it as a body field instead, so check both.
+        guardrailAction: stopReason == "guardrail_intervened" ? INTERVENED : invokeGuardrailAction(r)
     };
 }

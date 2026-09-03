@@ -69,22 +69,22 @@ const int STREAM_READ_SIZE = 16;
 // map) that necessarily outlives this call. `ai:ModelProvider` does not declare
 // `chatStream` isolated either, so the facades match the contract.
 function runChatStream(string providerName, ApiFamily family, string wireModelId,
-        readonly & ModelCodec codec, BedrockTransport transport, map<string> & readonly extraHeaders,
+        readonly & ModelConverter converter, BedrockTransport transport, map<string> & readonly extraHeaders,
         readonly & InferenceParams params, ai:ChatMessage[]|ai:ChatUserMessage messages,
         ai:ChatCompletionFunctions[] tools, string? stop)
         returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
     // Refused BEFORE any I/O, naming the escape hatch — the same shape as the
-    // module's other capability guards. The codec carries its own dialect, so the
+    // module's other capability guards. The converter carries its own dialect, so the
     // capability check and the dialect it implies are one lookup and cannot
-    // disagree — including on an opaque ARN, whose codec `selectCodec` resolves
+    // disagree — including on an opaque ARN, whose converter `selectConverter` resolves
     // from `modelSchema` rather than from the (ARN-valued) model id.
     //
-    // Every codec the module ships now carries a dialect, so this is unreachable
+    // Every converter the module ships now carries a dialect, so this is unreachable
     // today. It stays because the field is what makes streaming support a property
-    // of the codec: a dialect AWS ships next that this module can encode but not
+    // of the converter: a dialect AWS ships next that this module can encode but not
     // decode incrementally gets a clean refusal here rather than a silent empty
     // stream.
-    StreamDialect? dialect = codec.streamDialect;
+    StreamDialect? dialect = converter.streamDialect;
     if dialect is () {
         return error ai:Error(string `Streaming is not supported for model '${wireModelId}' on the ` +
             string `${family} route. Use 'apiFamily = CONVERSE' — ConverseStream is model-agnostic ` +
@@ -108,24 +108,41 @@ function runChatStream(string providerName, ApiFamily family, string wireModelId
     if spanTemperature is decimal {
         span.addTemperature(spanTemperature);
     }
-    span.addInputMessages(messagesForSpan(msgs));
     if tools.length() > 0 {
         span.addTools(tools);
     }
+
+    // Resolve BEFORE encoding, exactly as `runChat` does: flattens each prompt to
+    // parts and fetches any image URL, so the encoders stay pure. An image on a
+    // dialect that cannot carry one fails HERE — before the stream is opened, which
+    // is the only point at which a caller can still be handed a plain error rather
+    // than a stream that immediately faults.
+    [string?, ResolvedMessage[]]|ai:Error resolved = resolveMessages(msgs);
+    if resolved is ai:Error {
+        span.close(resolved);
+        return resolved;
+    }
+    [string?, ResolvedMessage[]] [system, rest] = resolved;
+    // Recorded from the RESOLVED form so an image becomes a placeholder rather than
+    // shipping megabytes of user data to the telemetry backend.
+    span.addInputMessages(messagesForSpan(system, rest));
 
     // The encoder is reused verbatim — a streaming request differs from a buffered
     // one only in how the route ASKS for the stream, never in what it asks for. On
     // `bedrock-runtime` that is a different operation and the body is byte-identical;
     // on Mantle it is `"stream": true` (plus `stream_options` where the dialect hides
-    // usage behind it), which the codec carries as `streamFields`.
-    [ai:ChatSystemMessage?, ai:ChatMessage[]] [system, rest] = hoistSystem(msgs);
-    RequestCodec encode = codec.encode;
+    // usage behind it), which the converter carries as `streamFields`.
+    RequestEncoder encode = converter.encode;
     json|ai:Error encoded = encode(system, rest, tools, stop, params);
     if encoded is ai:Error {
         span.close(encoded);
         return encoded;
     }
-    json|ai:Error body = withStreamFields(encoded, codec.streamFields);
+    // Mantle names the model in the BODY, not the path, so the same injection the
+    // buffered call makes has to happen here — a streamed Mantle request without it
+    // is rejected before a single chunk arrives.
+    json addressed = family == MANTLE ? injectModel(encoded, wireModelId) : encoded;
+    json|ai:Error body = withStreamFields(addressed, converter.streamFields);
     if body is ai:Error {
         span.close(body);
         return body;
@@ -166,8 +183,8 @@ isolated function withStreamFields(json encoded, map<json>? streamFields) return
         return encoded;
     }
     if encoded !is map<json> {
-        // Unreachable with the shipped codecs — every Mantle encoder builds an
-        // object — but a codec that returned an array could not carry `"stream"`,
+        // Unreachable with the shipped converters — every Mantle encoder builds an
+        // object — but a converter that returned an array could not carry `"stream"`,
         // and silently sending a NON-streaming request would hang the caller on a
         // stream that yields one buffered answer at the very end.
         return error ai:LlmInvalidGenerationError(
@@ -194,7 +211,7 @@ isolated function openEventSource(http:Response response, StreamWire wire, boole
             // The stdlib reader validates the content type, so this is also what a
             // Mantle response that is NOT a stream looks like — the request reached
             // the model but never asked for one. Naming that cause matters: the only
-            // way to get here is a codec (or a `routeOverrides` entry) whose
+            // way to get here is a converter (or a `routeOverrides` entry) whose
             // `streamFields` did not carry the flag, and the raw binding error says
             // nothing about it.
             return error ai:LlmConnectionError(

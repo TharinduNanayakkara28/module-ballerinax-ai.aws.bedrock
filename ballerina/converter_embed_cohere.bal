@@ -14,7 +14,7 @@
 
 import ballerina/ai;
 
-// Cohere Embed (embedding design §1, §6, §7). Like Mistral on the chat side,
+// Cohere Embed. Like Mistral on the chat side,
 // Cohere ships TWO request shapes under one vendor prefix, and only the model id
 // tells them apart:
 //
@@ -31,18 +31,18 @@ import ballerina/ai;
 // (not `dimensions`), and truncate's non-NONE values are LEFT/RIGHT (not START/END).
 // Response shape is common to both — `inputTokenCount` is `()` either way.
 
-// Cohere accepts up to 96 texts per call (embedding design §1) — the WIRE limit.
+// Cohere accepts up to 96 texts per call — the WIRE limit.
 const int COHERE_MAX_BATCH = 96;
 
 // Cohere Embed v3 — no output-size parameter, truncate spelled START/END.
-final readonly & EmbeddingCodec COHERE_EMBED_V3_CODEC = {
+final readonly & EmbeddingConverter COHERE_EMBED_V3_CONVERTER = {
     maxBatchSize: COHERE_MAX_BATCH,
     encode: encodeCohereEmbedV3,
     decode: decodeCohereEmbed
 };
 
 // Cohere Embed v4 — `output_dimension`, truncate spelled LEFT/RIGHT.
-final readonly & EmbeddingCodec COHERE_EMBED_V4_CODEC = {
+final readonly & EmbeddingConverter COHERE_EMBED_V4_CONVERTER = {
     maxBatchSize: COHERE_MAX_BATCH,
     encode: encodeCohereEmbedV4,
     decode: decodeCohereEmbed
@@ -56,7 +56,7 @@ final readonly & EmbeddingCodec COHERE_EMBED_V4_CODEC = {
 // Normalizes FIRST because callers hold the wire id, which may carry a CRIS geo
 // prefix — Cohere Embed v4 is the one embedding model with Geo and Global
 // inference ids (`us.cohere.embed-v4:0`, `global.cohere.embed-v4:0`). Matching the
-// raw string would silently drop such a caller onto the v3 codec, sending v3's
+// raw string would silently drop such a caller onto the v3 converter, sending v3's
 // truncate spelling and no `output_dimension` at all.
 // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-cohere-embed-v4.html
 isolated function usesCohereEmbedV4(string modelId) returns boolean {
@@ -64,7 +64,7 @@ isolated function usesCohereEmbedV4(string modelId) returns boolean {
     return bareId.startsWith("cohere.embed-v4");
 }
 
-// The shared part of both request shapes (embedding design §6, §7). `input_type` is
+// The shared part of both request shapes. `input_type` is
 // REQUIRED on every request — omitting it is a 400, and the wrong value silently
 // degrades retrieval.
 isolated function cohereEmbedBase(string[] texts, EmbeddingParams params) returns map<json>|ai:Error {
@@ -74,14 +74,14 @@ isolated function cohereEmbedBase(string[] texts, EmbeddingParams params) return
     }
     CohereInputType? inputType = params?.inputType;
     if inputType is () {
-        return error ai:Error("Cohere requires 'input_type' on every embedding request (design §6)");
+        return error ai:Error("Cohere requires 'input_type' on every embedding request");
     }
     return {"texts": texts, "input_type": inputType}; // an ARRAY, never a string
 }
 
-// Merges the §9.3-style passthrough last, so a caller can always override us.
+// Merges the passthrough-style merge last, so a caller can always override us.
 isolated function cohereApplyExtra(map<json> body, EmbeddingParams params) returns json {
-    json extra = params?.additionalModelRequestFields;
+    map<json>? extra = additionalFieldsToJson(params?.additionalModelRequestFields);
     if extra is map<json> {
         foreach [string, json] [k, v] in extra.entries() {
             body[k] = v;
@@ -102,7 +102,7 @@ isolated function encodeCohereEmbedV3(string[] texts, EmbeddingParams params) re
         body["truncate"] = truncate; // v3 spells these NONE|START|END — our enum's own values
     }
     // v3 has NO output-size parameter. `dimensions` is rejected at construction
-    // rather than silently dropped here (embedding design §8).
+    // rather than silently dropped here.
     return cohereApplyExtra(body, params);
 }
 
@@ -140,7 +140,7 @@ isolated function cohereV4Truncate(Truncate truncate) returns string {
     return "NONE";
 }
 
-// Decodes a Cohere embedding response (embedding design §7). Cohere reports NO
+// Decodes a Cohere embedding response. Cohere reports NO
 // token count — `inputTokenCount` is `()`, and the span call must be guarded.
 isolated function decodeCohereEmbed(json response) returns DecodedEmbedding|ai:Error {
     map<json>|error rr = response.ensureType();
@@ -175,7 +175,7 @@ isolated function decodeCohereEmbed(json response) returns DecodedEmbedding|ai:E
     }
     return {
         embeddings,
-        inputTokenCount: (), // Cohere has no such field (embedding design §1, §2)
+        inputTokenCount: (), // Cohere has no such field
         responseId: strField(r, "id")
     };
 }

@@ -62,6 +62,7 @@ import io.swagger.v3.core.util.Json;
 import io.swagger.v3.core.util.OpenAPISchema2JsonSchema;
 import io.swagger.v3.oas.models.media.Schema;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -239,7 +240,9 @@ class GenerateMethodModificationTask implements ModifierTask<SourceModifierConte
         private static final String GENERATE_METHOD_NAME = "generate";
         private static final String STRING = "string";
         private static final String BYTE = "byte";
-        private static final String NUMBER = "number";
+        private static final String INTEGER = "integer";
+        private static final BigDecimal BYTE_MIN = BigDecimal.ZERO;
+        private static final BigDecimal BYTE_MAX = BigDecimal.valueOf(255);
         private final SemanticModel semanticModel;
         private final TypeMapper typeMapper;
         private final List<ClassSymbol> providerSymbols;
@@ -291,7 +294,15 @@ class GenerateMethodModificationTask implements ModifierTask<SourceModifierConte
                     if (!typeReference.subtypeOf(anydataType)) {
                         return;
                     }
-                    typeSchemas.put(typeReference.definition().getName().get(),
+                    // The definition symbol of an anonymous type has no name. `typeSchemas`
+                    // is keyed by name, so a nameless definition has nothing to key on:
+                    // skip it rather than let `Optional.get()` throw NoSuchElementException,
+                    // which surfaces as a build crash instead of a diagnostic.
+                    Optional<String> definitionName = typeReference.definition().getName();
+                    if (definitionName.isEmpty()) {
+                        return;
+                    }
+                    typeSchemas.put(definitionName.get(),
                             getJsonSchema(typeMapper.getSchema(typeReference)));
                 }
                 case ArrayTypeSymbol arrayType ->
@@ -349,12 +360,28 @@ class GenerateMethodModificationTask implements ModifierTask<SourceModifierConte
                 oneOf.forEach(GenerateMethodJsonSchemaGenerator::modifySchema);
             }
 
-            // Override default ballerina byte to json schema mapping
-            if (BYTE.equals(schema.getFormat()) && STRING.equals(schema.getType())) {
-                schema.setFormat(null);
-                schema.setType(NUMBER);
+            // `additionalProperties` carries the open/closed record distinction: a closed
+            // record maps to `false`, a map-typed rest field to a Schema. It survives
+            // `removeUnwantedFields`, so recurse into the Schema form to strip the
+            // unwanted keywords nested inside it too.
+            if (schema.getAdditionalProperties() instanceof Schema<?> additionalPropertiesSchema) {
+                modifySchema(additionalPropertiesSchema);
             }
+
+            // Override default ballerina byte to json schema mapping. Ballerina `byte` is
+            // an integer in 0..255, which Swagger models as {type: string, format: byte}.
+            // Emit a BOUNDED integer, and apply it AFTER removeUnwantedFields() — that
+            // method clears `minimum`/`maximum`, so setting the bounds before it would
+            // silently drop them and leave a schema that accepts fractions and values
+            // outside 0..255.
+            boolean isByte = BYTE.equals(schema.getFormat()) && STRING.equals(schema.getType());
             removeUnwantedFields(schema);
+            if (isByte) {
+                schema.setFormat(null);
+                schema.setType(INTEGER);
+                schema.setMinimum(BYTE_MIN);
+                schema.setMaximum(BYTE_MAX);
+            }
         }
 
         private static void removeUnwantedFields(Schema schema) {
@@ -377,7 +404,9 @@ class GenerateMethodModificationTask implements ModifierTask<SourceModifierConte
             schema.setMinItems(null);
             schema.setMaxProperties(null);
             schema.setMinProperties(null);
-            schema.setAdditionalProperties(null);
+            // NOT cleared: `additionalProperties` is meaningful output, not noise. Omitting
+            // it lets a model return unknown object fields; a closed Ballerina record must
+            // keep emitting `additionalProperties: false`.
             schema.set$ref(null);
             schema.setReadOnly(null);
             schema.setWriteOnly(null);

@@ -12,110 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// typedesc -> JSON schema for generate()'s expected response type (CLAUDE.md §3).
+// typedesc -> JSON schema for generate()'s expected response type.
 // Ported from the reference module module-ballerinax-ai.openai (`to_json_schema.bal`)
 // so this module owns its schema generation, as its siblings do.
 //
-// Resolution order, per the reference:
+// Resolution order:
 //   1. the `@ai:JsonSchema` annotation ballerina/ai's compiler plugin attaches at
 //      the generate() call site (records),
-//   2. runtime generation in this module's `Native` (arrays, unions, simple types),
-//   3. the pure-Ballerina fallback below.
-// A type none of them can express is an `ai:Error` — never a silently empty schema.
+//   2. runtime generation in this module's `Native` (arrays, unions, simple types).
+// A type neither can express is an `ai:Error` — never a silently empty schema.
+//
+// The reference carries a THIRD step, a pure-Ballerina fallback gated on `Native`
+// returning nil. That step is not reproduced here because it cannot run: `Native`
+// either returns a schema or raises, and it already covers a strict superset of what
+// the fallback expressed (recursive arrays and unions, versus simple types and
+// simple-member arrays only). Keeping it would mean ~70 lines that read like a
+// safety net while being unreachable.
 
 import ballerina/ai;
 import ballerina/jballerina.java;
 
-type JsonSchema record {|
-    string 'type?;
-    (JsonSchema|JsonArraySchema)[] oneOf?;
-    map<JsonSchema|JsonArraySchema|map<json>> properties?;
-    string[] required?;
-|};
-
-type JsonArraySchema record {|
-    string 'type = "array";
-    JsonSchema items;
-|};
-
 isolated function generateJsonSchemaForTypedescAsJson(typedesc<json> expectedResponseTypedesc)
         returns map<json>|ai:Error =>
     let map<json>? ann = expectedResponseTypedesc.@ai:JsonSchema in ann
-                ?: check generateJsonSchemaForTypedescNative(expectedResponseTypedesc)
-                ?: check generateJsonSchemaForTypedesc(expectedResponseTypedesc);
+                ?: check generateJsonSchemaForTypedescNative(expectedResponseTypedesc);
 
-isolated function generateJsonSchemaForTypedesc(typedesc<json> expectedResponseTypedesc)
-        returns JsonSchema|JsonArraySchema|map<json>|ai:Error {
-    if isSimpleType(expectedResponseTypedesc) {
-        return <JsonSchema>{
-            'type: getStringRepresentation(<typedesc<json>>expectedResponseTypedesc)
-        };
-    }
-
-    boolean isArray = expectedResponseTypedesc is typedesc<json[]>;
-
-    if isArray {
-        typedesc<json> arrayMemberType = getArrayMemberType(<typedesc<json[]>>expectedResponseTypedesc);
-        // `items` describes the MEMBER type, so its nilability must be derived from
-        // the member. The reference module computed this once from the OUTER
-        // typedesc, which is backwards in both directions: it drops `null` from
-        // `items` for `int?[]` and adds it for `int[]?`.
-        boolean nilableMember = containsNil(arrayMemberType);
-        if isSimpleType(arrayMemberType) {
-            return <JsonArraySchema>{
-                items: !nilableMember ? {
-                        'type: getStringRepresentation(<typedesc<json>>arrayMemberType)
-                    } :
-                    {
-                        oneOf: [
-                            {
-                                'type: getStringRepresentation(<typedesc<json>>arrayMemberType)
-                            },
-                            {
-                                'type: "null"
-                            }
-                        ]
-                    }
-            };
-        }
-    }
-
-    return error("Runtime schema generation is not yet supported for type " + expectedResponseTypedesc.toString());
-}
-
-isolated function getArrayMemberType(typedesc<json> expectedResponseTypedesc) returns typedesc<json> = @java:Method {
-    name: "getArrayMemberType",
-    'class: "io.ballerina.lib.ai.aws.bedrock.Native"
-} external;
-
-isolated function containsNil(typedesc<json> expectedResponseTypedesc) returns boolean = @java:Method {
-    name: "containsNil",
-    'class: "io.ballerina.lib.ai.aws.bedrock.Native"
-} external;
-
-isolated function isSimpleType(typedesc<json> expectedResponseTypedesc) returns boolean =>
-    expectedResponseTypedesc is typedesc<string|int|float|decimal|boolean|()>;
-
-isolated function getStringRepresentation(typedesc<json> fieldType) returns string {
-    if fieldType is typedesc<()> {
-        return "null";
-    }
-    if fieldType is typedesc<string> {
-        return "string";
-    }
-    if fieldType is typedesc<int> {
-        return "integer";
-    }
-    if fieldType is typedesc<float|decimal> {
-        return "number";
-    }
-    if fieldType is typedesc<boolean> {
-        return "boolean";
-    }
-
-    panic error("JSON schema generation is not yet supported for type: " + fieldType.toString());
-}
-
-isolated function generateJsonSchemaForTypedescNative(typedesc<anydata> td) returns map<json>?|ai:Error = @java:Method {
+isolated function generateJsonSchemaForTypedescNative(typedesc<anydata> td) returns map<json>|ai:Error = @java:Method {
     'class: "io.ballerina.lib.ai.aws.bedrock.Native"
 } external;

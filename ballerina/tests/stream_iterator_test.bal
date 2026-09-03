@@ -331,9 +331,9 @@ function testAMantleRoutedModelResolvesAStreamingRouteWithoutABodyRewrite() retu
     Route route = check resolveRoute(CLAUDE_SONNET_5, REGION);
     test:assertEquals(route.family, MANTLE, "a Mantle-capable bare id prefers Mantle under AUTO");
 
-    readonly & ModelCodec codec = check selectCodec(route);
-    test:assertEquals(codec.streamDialect, ANTHROPIC_STREAM, "Mantle Messages reuses Anthropic's events");
-    test:assertEquals(codec.streamFields, {"stream": true}, "Mantle asks for the stream in the BODY");
+    readonly & ModelConverter converter = check selectConverter(route);
+    test:assertEquals(converter.streamDialect, ANTHROPIC_STREAM, "Mantle Messages reuses Anthropic's events");
+    test:assertEquals(converter.streamFields, {"stream": true}, "Mantle asks for the stream in the BODY");
 
     Endpoint ep = check buildEndpoint(route);
     test:assertEquals(ep.streamPath, ep.path, "and streams from the SAME path, not a sibling operation");
@@ -342,11 +342,11 @@ function testAMantleRoutedModelResolvesAStreamingRouteWithoutABodyRewrite() retu
 
 @test:Config {}
 function testTheStreamingGuardStillRefusesACodecWithoutADialect() {
-    // Every shipped codec streams, so the guard in `runChatStream` is unreachable
-    // today — but it is what keeps a future codec that this module can encode and
+    // Every shipped converter streams, so the guard in `runChatStream` is unreachable
+    // today — but it is what keeps a future converter that this module can encode and
     // cannot decode incrementally from returning a silent, empty stream instead of an
     // error. Pinned at the field, since no route can exercise it any more.
-    readonly & ModelCodec unstreamable = {
+    readonly & ModelConverter unstreamable = {
         encode: encodeConverse,
         decode: decodeConverse,
         toolChoice: CONVERSE_TOOL_CHOICE,
@@ -359,7 +359,7 @@ function testTheStreamingGuardStillRefusesACodecWithoutADialect() {
 function testGenerateStreamRejectsANonStringTargetType() {
     // Structured output cannot stream: the typed value comes out of a forced tool
     // call whose arguments are only bindable once the whole JSON has arrived.
-    AnthropicModelProvider provider = checkpanic new (TEST_CREDS, CLAUDE_SONNET_5, REGION,
+    AnthropicModelProvider provider = checkpanic new (CLAUDE_SONNET_5, TEST_CREDS, REGION,
             config = {apiFamily: CONVERSE});
     stream<FruitShape, ai:Error?>|ai:Error typed = provider->generateStream(`Name a fruit.`);
     if typed !is ai:Error {

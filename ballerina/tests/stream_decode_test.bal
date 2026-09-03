@@ -319,51 +319,51 @@ function testAnthropicFinishReasonMapping() {
 
 @test:Config {}
 function testStreamDialectIsCarriedByTheCodec() returns error? {
-    // Converse is model-agnostic — every vendor, one dialect, one codec.
-    test:assertEquals((check selectCodec(check resolveRoute("anthropic.claude-sonnet-4-6", REGION))).streamDialect,
+    // Converse is model-agnostic — every vendor, one dialect, one converter.
+    test:assertEquals((check selectConverter(check resolveRoute("anthropic.claude-sonnet-4-6", REGION))).streamDialect,
             CONVERSE_STREAM);
-    test:assertEquals((check selectCodec(check resolveRoute("mistral.mistral-large-2407", REGION))).streamDialect,
+    test:assertEquals((check selectConverter(check resolveRoute("mistral.mistral-large-2407", REGION))).streamDialect,
             CONVERSE_STREAM);
 
     // On Invoke the dialect is the vendor's own.
-    test:assertEquals(INVOKE_ANTHROPIC_CODEC.streamDialect, ANTHROPIC_STREAM);
+    test:assertEquals(INVOKE_ANTHROPIC_CONVERTER.streamDialect, ANTHROPIC_STREAM);
     // Nova's Invoke frames are Converse-shaped — the same pairing that lets
-    // INVOKE_NOVA_CODEC reuse decodeConverse.
-    test:assertEquals(INVOKE_NOVA_CODEC.streamDialect, CONVERSE_STREAM);
+    // INVOKE_NOVA_CONVERTER reuse decodeConverse.
+    test:assertEquals(INVOKE_NOVA_CONVERTER.streamDialect, CONVERSE_STREAM);
 }
 
 @test:Config {}
 function testEveryShippedCodecCarriesAStreamingDialect() {
     // The capability matrix, pinned. `runChatStream` refuses exactly
-    // `streamDialect is ()`, so a codec that loses its dialect stops streaming — a
+    // `streamDialect is ()`, so a converter that loses its dialect stops streaming — a
     // silent capability regression for every model on that route.
-    (readonly & ModelCodec)[] codecs = [
-        CONVERSE_CODEC,
-        INVOKE_ANTHROPIC_CODEC,
-        INVOKE_NOVA_CODEC,
-        INVOKE_OPENAI_CHAT_CODEC,
-        INVOKE_DEEPSEEK_CODEC,
-        INVOKE_MISTRAL_CHAT_CODEC,
-        INVOKE_MISTRAL_TEXT_CODEC,
-        MANTLE_MESSAGES_CODEC,
-        MANTLE_RESPONSES_CODEC,
-        MANTLE_CHAT_CODEC
+    (readonly & ModelConverter)[] converters = [
+        CONVERSE_CONVERTER,
+        INVOKE_ANTHROPIC_CONVERTER,
+        INVOKE_NOVA_CONVERTER,
+        INVOKE_OPENAI_CHAT_CONVERTER,
+        INVOKE_DEEPSEEK_CONVERTER,
+        INVOKE_MISTRAL_CHAT_CONVERTER,
+        INVOKE_MISTRAL_TEXT_CONVERTER,
+        MANTLE_MESSAGES_CONVERTER,
+        MANTLE_RESPONSES_CONVERTER,
+        MANTLE_CHAT_CONVERTER
     ];
-    foreach readonly & ModelCodec codec in codecs {
-        test:assertTrue(codec.streamDialect is StreamDialect, "every shipped codec must stream");
+    foreach readonly & ModelConverter converter in converters {
+        test:assertTrue(converter.streamDialect is StreamDialect, "every shipped converter must stream");
     }
 
     // Mantle reuses the vendors' own event models; only the framing differs.
-    test:assertEquals(MANTLE_MESSAGES_CODEC.streamDialect, ANTHROPIC_STREAM);
-    test:assertEquals(MANTLE_RESPONSES_CODEC.streamDialect, RESPONSES_STREAM);
-    test:assertEquals(MANTLE_CHAT_CODEC.streamDialect, OPENAI_CHAT_STREAM);
-    // Mistral chat streams through the OpenAI decoder despite its own codec: the
+    test:assertEquals(MANTLE_MESSAGES_CONVERTER.streamDialect, ANTHROPIC_STREAM);
+    test:assertEquals(MANTLE_RESPONSES_CONVERTER.streamDialect, RESPONSES_STREAM);
+    test:assertEquals(MANTLE_CHAT_CONVERTER.streamDialect, OPENAI_CHAT_STREAM);
+    // Mistral chat streams through the OpenAI decoder despite its own converter: the
     // buffered dialects differ, the streamed chunk differs only in the stop-reason
     // spelling.
-    test:assertEquals(INVOKE_MISTRAL_CHAT_CODEC.streamDialect, OPENAI_CHAT_STREAM);
-    test:assertEquals(INVOKE_OPENAI_CHAT_CODEC.streamDialect, OPENAI_CHAT_STREAM);
-    test:assertEquals(INVOKE_MISTRAL_TEXT_CODEC.streamDialect, TEXT_COMPLETION_STREAM);
-    test:assertEquals(INVOKE_DEEPSEEK_CODEC.streamDialect, TEXT_COMPLETION_STREAM);
+    test:assertEquals(INVOKE_MISTRAL_CHAT_CONVERTER.streamDialect, OPENAI_CHAT_STREAM);
+    test:assertEquals(INVOKE_OPENAI_CHAT_CONVERTER.streamDialect, OPENAI_CHAT_STREAM);
+    test:assertEquals(INVOKE_MISTRAL_TEXT_CONVERTER.streamDialect, TEXT_COMPLETION_STREAM);
+    test:assertEquals(INVOKE_DEEPSEEK_CONVERTER.streamDialect, TEXT_COMPLETION_STREAM);
 }
 
 @test:Config {}
@@ -372,25 +372,25 @@ function testOnlyMantleCodecsAskForTheStreamInTheBody() {
     // on Mantle. A stray `"stream": true` sent to InvokeModelWithResponseStream is an
     // unknown inference parameter, and a missing one on Mantle silently returns the
     // whole answer in a single buffered chunk at the end.
-    test:assertEquals(CONVERSE_CODEC.streamFields, ());
-    test:assertEquals(INVOKE_ANTHROPIC_CODEC.streamFields, ());
-    test:assertEquals(INVOKE_NOVA_CODEC.streamFields, ());
-    test:assertEquals(INVOKE_OPENAI_CHAT_CODEC.streamFields, ());
-    test:assertEquals(INVOKE_MISTRAL_TEXT_CODEC.streamFields, ());
+    test:assertEquals(CONVERSE_CONVERTER.streamFields, ());
+    test:assertEquals(INVOKE_ANTHROPIC_CONVERTER.streamFields, ());
+    test:assertEquals(INVOKE_NOVA_CONVERTER.streamFields, ());
+    test:assertEquals(INVOKE_OPENAI_CHAT_CONVERTER.streamFields, ());
+    test:assertEquals(INVOKE_MISTRAL_TEXT_CONVERTER.streamFields, ());
 
-    test:assertEquals(MANTLE_MESSAGES_CODEC.streamFields, {"stream": true});
-    test:assertEquals(MANTLE_RESPONSES_CODEC.streamFields, {"stream": true});
+    test:assertEquals(MANTLE_MESSAGES_CONVERTER.streamFields, {"stream": true});
+    test:assertEquals(MANTLE_RESPONSES_CONVERTER.streamFields, {"stream": true});
     // Chat Completions reports NO usage on a stream unless asked.
-    test:assertEquals(MANTLE_CHAT_CODEC.streamFields,
+    test:assertEquals(MANTLE_CHAT_CONVERTER.streamFields,
             {"stream": true, "stream_options": {"include_usage": true}});
 }
 
 @test:Config {}
 function testStreamFieldsAreMergedIntoTheEncodedBody() returns error? {
     // The encoder is shared with the buffered path, so the flag has to be added
-    // after encoding — without disturbing what the codec produced.
+    // after encoding — without disturbing what the converter produced.
     json encoded = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 100};
-    json body = check withStreamFields(encoded, MANTLE_CHAT_CODEC.streamFields);
+    json body = check withStreamFields(encoded, MANTLE_CHAT_CONVERTER.streamFields);
     map<json> merged = check body.ensureType();
     test:assertEquals(merged["stream"], true);
     test:assertEquals(merged["stream_options"], <json>{"include_usage": true});
@@ -402,45 +402,46 @@ function testStreamFieldsAreMergedIntoTheEncodedBody() returns error? {
 
 @test:Config {}
 function testEveryCodecsDialectMatchesItsDecoder() {
-    // A dialect names the decoder that reads that codec's frames. If a codec is ever
+    // A dialect names the decoder that reads that converter's frames. If a converter is ever
     // given a dialect whose decoder cannot read its wire shape, the stream decodes to
     // silence rather than failing — so the pairing is pinned here.
-    test:assertTrue(newStreamDecoder(<StreamDialect>CONVERSE_CODEC.streamDialect) is ConverseStreamDecoder);
-    test:assertTrue(newStreamDecoder(<StreamDialect>INVOKE_NOVA_CODEC.streamDialect) is ConverseStreamDecoder);
-    test:assertTrue(newStreamDecoder(<StreamDialect>INVOKE_ANTHROPIC_CODEC.streamDialect) is AnthropicStreamDecoder);
+    test:assertTrue(newStreamDecoder(<StreamDialect>CONVERSE_CONVERTER.streamDialect) is ConverseStreamDecoder);
+    test:assertTrue(newStreamDecoder(<StreamDialect>INVOKE_NOVA_CONVERTER.streamDialect) is ConverseStreamDecoder);
+    test:assertTrue(newStreamDecoder(<StreamDialect>INVOKE_ANTHROPIC_CONVERTER.streamDialect) is AnthropicStreamDecoder);
     // Mantle Messages rides the SAME decoder as Invoke-Anthropic — one event model,
     // two wire formats.
-    test:assertTrue(newStreamDecoder(<StreamDialect>MANTLE_MESSAGES_CODEC.streamDialect) is AnthropicStreamDecoder);
-    test:assertTrue(newStreamDecoder(<StreamDialect>MANTLE_CHAT_CODEC.streamDialect) is OpenAIChatStreamDecoder);
-    test:assertTrue(newStreamDecoder(<StreamDialect>MANTLE_RESPONSES_CODEC.streamDialect) is ResponsesStreamDecoder);
+    test:assertTrue(newStreamDecoder(<StreamDialect>MANTLE_MESSAGES_CONVERTER.streamDialect) is AnthropicStreamDecoder);
+    test:assertTrue(newStreamDecoder(<StreamDialect>MANTLE_CHAT_CONVERTER.streamDialect) is OpenAIChatStreamDecoder);
+    test:assertTrue(newStreamDecoder(<StreamDialect>MANTLE_RESPONSES_CONVERTER.streamDialect) is ResponsesStreamDecoder);
     test:assertTrue(
-            newStreamDecoder(<StreamDialect>INVOKE_MISTRAL_CHAT_CODEC.streamDialect) is OpenAIChatStreamDecoder);
+            newStreamDecoder(<StreamDialect>INVOKE_MISTRAL_CHAT_CONVERTER.streamDialect) is OpenAIChatStreamDecoder);
     test:assertTrue(
-            newStreamDecoder(<StreamDialect>INVOKE_MISTRAL_TEXT_CODEC.streamDialect) is TextCompletionStreamDecoder);
+            newStreamDecoder(<StreamDialect>INVOKE_MISTRAL_TEXT_CONVERTER.streamDialect) is TextCompletionStreamDecoder);
     test:assertTrue(
-            newStreamDecoder(<StreamDialect>INVOKE_DEEPSEEK_CODEC.streamDialect) is TextCompletionStreamDecoder);
+            newStreamDecoder(<StreamDialect>INVOKE_DEEPSEEK_CONVERTER.streamDialect) is TextCompletionStreamDecoder);
 }
 
 @test:Config {}
-function testArnRoutedInvokeModelStillResolvesAStreamDialect() returns error? {
+function testArnRoutedModelStillResolvesAStreamDialect() returns error? {
     // REGRESSION. The dialect used to be looked up from `bareModelId`, which for an
-    // opaque ARN IS the ARN string — matching no vendor prefix. So an imported-model
-    // ARN with `modelSchema` got a codec claiming streaming and then failed dialect
-    // selection every time: `chat()` worked and `chatStream()` never did, with an
-    // internal-sounding "No streaming dialect for 'arn:aws:...'" message.
-    string arn = "arn:aws:bedrock:us-west-2:123456789012:imported-model/abc123def456";
-
-    Route claude = check resolveRoute(arn, REGION, {modelSchema: ANTHROPIC});
-    test:assertEquals(claude.bareModelId, arn, "an opaque ARN is its own bare id — the old lookup key");
-    test:assertEquals((check selectCodec(claude, ANTHROPIC)).streamDialect, ANTHROPIC_STREAM);
-
-    Route nova = check resolveRoute(arn, REGION, {modelSchema: NOVA});
-    test:assertEquals((check selectCodec(nova, NOVA)).streamDialect, CONVERSE_STREAM);
-
-    // And an ARN that resolves to Converse streams like any other Converse route.
+    // opaque ARN IS the ARN string — matching no vendor prefix. So an ARN-routed model
+    // got a converter claiming streaming and then failed dialect selection every time:
+    // `chat()` worked and `chatStream()` never did, with an internal-sounding
+    // "No streaming dialect for 'arn:aws:...'" message. Hanging the dialect off the
+    // converter is what made that unrepresentable.
     Route provisioned = check resolveRoute(
             "arn:aws:bedrock:eu-west-1:123456789012:provisioned-model/xyz", REGION);
-    test:assertEquals((check selectCodec(provisioned)).streamDialect, CONVERSE_STREAM);
+    test:assertEquals(provisioned.bareModelId,
+            "arn:aws:bedrock:eu-west-1:123456789012:provisioned-model/xyz",
+            "an opaque ARN is its own bare id — the old lookup key");
+    test:assertEquals((check selectConverter(provisioned)).streamDialect, CONVERSE_STREAM);
+
+    // The `imported-model/` half of this regression is gone with the route itself:
+    // those ARNs are refused at resolution now, so no converter is ever selected for
+    // one. Pinned here so the narrowing is deliberate rather than silent.
+    Route|error imported = resolveRoute(
+            "arn:aws:bedrock:us-west-2:123456789012:imported-model/abc123def456", REGION);
+    test:assertTrue(imported is error, "imported-model ARNs are refused before a converter is picked");
 }
 
 // ---------------------------------------------------------------------------

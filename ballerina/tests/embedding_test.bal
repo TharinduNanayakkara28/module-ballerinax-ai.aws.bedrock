@@ -15,13 +15,13 @@
 import ballerina/ai;
 import ballerina/test;
 
-// Embedding tests (embedding design §10; CLAUDE.md §4).
+// Embedding tests.
 
-// ---- codec golden files (§10.1) ----
+// ---- converter golden files ----
 
 @test:Config {}
 function testTitanEmitsInputTextAsAString() returns error? {
-    // §1: `inputText` is a STRING, not an array — the whole reason maxBatchSize is 1.
+    // `inputText` is a STRING, not an array — the whole reason maxBatchSize is 1.
     map<json> body = check encodeTitanEmbed(["hello"], {}).ensureType();
     test:assertEquals(body["inputText"], "hello");
     test:assertTrue(body["inputText"] is string, "inputText must be a string, never an array");
@@ -43,7 +43,7 @@ function testTitanRejectsMoreThanOneTextPerCall() {
 
 @test:Config {}
 function testCohereEmitsTextsAsAnArrayAndAlwaysEmitsInputType() returns error? {
-    // §6: input_type is REQUIRED on every request.
+    // input_type is REQUIRED on every request.
     map<json> body = check encodeCohereEmbedV3(["a", "b"], {inputType: SEARCH_DOCUMENT}).ensureType();
     test:assertEquals(body["texts"], <json>["a", "b"]);
     test:assertTrue(body["texts"] is json[], "texts must be an array, never a string");
@@ -53,7 +53,7 @@ function testCohereEmitsTextsAsAnArrayAndAlwaysEmitsInputType() returns error? {
 
 @test:Config {}
 function testCohereQueryInputTypeIsDistinctFromDocument() returns error? {
-    // Getting these backwards silently degrades retrieval (§6).
+    // Getting these backwards silently degrades retrieval.
     map<json> query = check encodeCohereEmbedV3(["q"], {inputType: SEARCH_QUERY}).ensureType();
     test:assertEquals(query["input_type"], "search_query");
 }
@@ -77,7 +77,7 @@ function testCohereRejectsOverSizedWindow() {
     test:assertTrue(body is ai:Error, "Cohere accepts at most 96 texts per call");
 }
 
-// ---- decode: the inputTokenCount asymmetry (§10.1) ----
+// ---- decode: the inputTokenCount asymmetry ----
 
 @test:Config {}
 function testTitanDecodePopulatesInputTokenCount() returns error? {
@@ -91,7 +91,7 @@ function testTitanDecodePopulatesInputTokenCount() returns error? {
 
 @test:Config {}
 function testCohereDecodeHasNoInputTokenCount() returns error? {
-    // This is the assertion that catches a naive addInputTokenCount crash (§10.1).
+    // This is the assertion that catches a naive addInputTokenCount crash.
     json canned = {"embeddings": [[0.1, 0.2], [0.3, 0.4]], "id": "req-9", "response_type": "embeddings_floats"};
     DecodedEmbedding decoded = check decodeCohereEmbed(canned);
     test:assertEquals(decoded.embeddings.length(), 2);
@@ -108,7 +108,7 @@ function testCohereDecodeAcceptsTypedEmbeddingsShape() returns error? {
     test:assertEquals(decoded.embeddings[0], <ai:Vector>[0.5, 0.6]);
 }
 
-// ---- batching: the highest-value test (§10.2) ----
+// ---- batching: the highest-value test ----
 
 @test:Config {}
 function testTitanBatchingIs100RequestsFor100Chunks() {
@@ -116,8 +116,8 @@ function testTitanBatchingIs100RequestsFor100Chunks() {
     foreach int i in 0 ..< 100 {
         texts.push(string `chunk-${i}`);
     }
-    string[][] windows = partitionTexts(texts, TITAN_EMBED_CODEC.maxBatchSize);
-    test:assertEquals(TITAN_EMBED_CODEC.maxBatchSize, 1);
+    string[][] windows = partitionTexts(texts, TITAN_EMBED_CONVERTER.maxBatchSize);
+    test:assertEquals(TITAN_EMBED_CONVERTER.maxBatchSize, 1);
     test:assertEquals(windows.length(), 100, "Titan has no batch input → 100 sequential requests");
     foreach string[] window in windows {
         test:assertEquals(window.length(), 1);
@@ -130,8 +130,8 @@ function testCohereBatchingIs2RequestsFor100Chunks() {
     foreach int i in 0 ..< 100 {
         texts.push(string `chunk-${i}`);
     }
-    string[][] windows = partitionTexts(texts, COHERE_EMBED_V3_CODEC.maxBatchSize);
-    test:assertEquals(COHERE_EMBED_V3_CODEC.maxBatchSize, 96);
+    string[][] windows = partitionTexts(texts, COHERE_EMBED_V3_CONVERTER.maxBatchSize);
+    test:assertEquals(COHERE_EMBED_V3_CONVERTER.maxBatchSize, 96);
     test:assertEquals(windows.length(), 2, "ceil(100/96) == 2 requests");
     test:assertEquals(windows[0].length(), 96);
     test:assertEquals(windows[1].length(), 4);
@@ -156,11 +156,11 @@ function testPartitioningPreservesInputOrder() {
     test:assertEquals(flattened[99], "chunk-99");
 }
 
-// ---- construction errors (§10.3) ----
+// ---- construction errors ----
 
 @test:Config {}
 function testTitanRejectsACohereModelId() {
-    TitanEmbeddingProvider|ai:Error provider = new (TEST_CREDS, "cohere.embed-english-v3", REGION);
+    TitanEmbeddingProvider|ai:Error provider = new ("cohere.embed-english-v3", TEST_CREDS, REGION);
     test:assertTrue(provider is ai:Error);
     if provider is ai:Error {
         test:assertTrue(provider.message().includes("amazon.titan-embed"), provider.message());
@@ -169,7 +169,7 @@ function testTitanRejectsACohereModelId() {
 
 @test:Config {}
 function testCohereRejectsATitanModelId() {
-    CohereEmbeddingProvider|ai:Error provider = new (TEST_CREDS, "amazon.titan-embed-text-v2:0", REGION);
+    CohereEmbeddingProvider|ai:Error provider = new ("amazon.titan-embed-text-v2:0", TEST_CREDS, REGION);
     test:assertTrue(provider is ai:Error);
     if provider is ai:Error {
         test:assertTrue(provider.message().includes("cohere.embed"), provider.message());
@@ -178,9 +178,9 @@ function testCohereRejectsATitanModelId() {
 
 @test:Config {}
 function testEmbeddingArnIsRejectedAtConstruction() {
-    // v1: ARNs are out of scope — an ARN carries no vendor prefix (§5).
+    // v1: ARNs are out of scope — an ARN carries no vendor prefix.
     TitanEmbeddingProvider|ai:Error provider = new (
-        TEST_CREDS, "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/abc", REGION);
+        "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/abc", TEST_CREDS, REGION);
     test:assertTrue(provider is ai:Error);
     if provider is ai:Error {
         test:assertTrue(provider.message().includes("ARN"), provider.message());
@@ -189,22 +189,22 @@ function testEmbeddingArnIsRejectedAtConstruction() {
 
 @test:Config {}
 function testEmbeddingProvidersConstructAndNormalizeCris() returns error? {
-    TitanEmbeddingProvider titan = check new (TEST_CREDS, TITAN_EMBED_TEXT_V2, REGION);
-    CohereEmbeddingProvider cohere = check new (TEST_CREDS, COHERE_EMBED_ENGLISH_V3, REGION,
+    TitanEmbeddingProvider titan = check new (TITAN_EMBED_TEXT_V2, TEST_CREDS, REGION);
+    CohereEmbeddingProvider cohere = check new (COHERE_EMBED_ENGLISH_V3, TEST_CREDS, REGION,
         inputType = SEARCH_QUERY);
-    // Cohere Embed v4 is offered cross-region, so a CRIS-prefixed id must resolve (§4).
-    CohereEmbeddingProvider cris = check new (TEST_CREDS, "us.cohere.embed-v4:0", REGION);
+    // Cohere Embed v4 is offered cross-region, so a CRIS-prefixed id must resolve.
+    CohereEmbeddingProvider cris = check new ("us.cohere.embed-v4:0", TEST_CREDS, REGION);
     test:assertTrue(titan is TitanEmbeddingProvider);
     test:assertTrue(cohere is CohereEmbeddingProvider);
     test:assertTrue(cris is CohereEmbeddingProvider);
 }
 
-// ---- chunk type guard (§10.4) ----
+// ---- chunk type guard ----
 
 @test:Config {}
 function testNonTextChunkReturnsCleanErrorFromEmbedAndBatchEmbed() returns error? {
     // The guard fires before any I/O, so this needs no AWS.
-    TitanEmbeddingProvider titan = check new (TEST_CREDS, TITAN_EMBED_TEXT_V2, REGION);
+    TitanEmbeddingProvider titan = check new (TITAN_EMBED_TEXT_V2, TEST_CREDS, REGION);
     ai:Chunk imageChunk = {'type: "image", content: "not-text"};
 
     ai:Embedding|ai:Error single = titan->embed(imageChunk);
@@ -222,7 +222,7 @@ function testNonTextChunkReturnsCleanErrorFromEmbedAndBatchEmbed() returns error
 
 @test:Config {}
 function testNonTextChunkRejectedByCohereToo() returns error? {
-    CohereEmbeddingProvider cohere = check new (TEST_CREDS, COHERE_EMBED_ENGLISH_V3, REGION);
+    CohereEmbeddingProvider cohere = check new (COHERE_EMBED_ENGLISH_V3, TEST_CREDS, REGION);
     ai:Chunk imageChunk = {'type: "image", content: "not-text"};
     ai:Embedding[]|ai:Error batch = cohere->batchEmbed([imageChunk]);
     test:assertTrue(batch is ai:Error);
@@ -232,7 +232,7 @@ function testNonTextChunkRejectedByCohereToo() returns error? {
 
 @test:Config {}
 function testCohereV4UsesOutputDimensionNotDimensions() returns error? {
-    // REGRESSION: the codec emitted `dimensions`, which v4 does not define. Cohere
+    // REGRESSION: the converter emitted `dimensions`, which v4 does not define. Cohere
     // would ignore it and return 1536-wide vectors while the caller believed they
     // had asked for 256 — a silent corpus-width mismatch, not an error.
     // https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-embed-v4.html
@@ -244,7 +244,7 @@ function testCohereV4UsesOutputDimensionNotDimensions() returns error? {
 @test:Config {}
 function testCohereV3HasNoOutputSizeParameterAtAll() returns error? {
     // v3 defines no output-size field; `dimensions` is refused at construction, so
-    // the codec must never invent one.
+    // the converter must never invent one.
     map<json> body = check encodeCohereEmbedV3(["hi"], {inputType: SEARCH_DOCUMENT, dimensions: 256}).ensureType();
     test:assertFalse(body.hasKey("dimensions"));
     test:assertFalse(body.hasKey("output_dimension"));
@@ -282,44 +282,44 @@ function testCohereVersionIsSelectedByModelId() {
     test:assertFalse(usesCohereEmbedV4("cohere.embed-multilingual-v3"));
 }
 
-// ---- dimensions is validated at construction, not at AWS (design §8) ----
+// ---- dimensions is validated at construction, not at AWS ----
 
 @test:Config {}
 function testTitanRejectsAnUnsupportedDimensions() {
-    TitanEmbeddingProvider|ai:Error provider = new (TEST_CREDS, TITAN_EMBED_TEXT_V2, "us-east-1", dimensions = 999);
+    TitanEmbeddingProvider|ai:Error provider = new (TITAN_EMBED_TEXT_V2, TEST_CREDS, "us-east-1", dimensions = 999);
     test:assertTrue(provider is ai:Error, "999 is not one of Titan V2's accepted widths");
 }
 
 @test:Config {}
 function testTitanV1RejectsDimensionsEntirely() {
-    TitanEmbeddingProvider|ai:Error provider = new (TEST_CREDS, TITAN_EMBED_TEXT_V1, "us-east-1", dimensions = 512);
+    TitanEmbeddingProvider|ai:Error provider = new (TITAN_EMBED_TEXT_V1, TEST_CREDS, "us-east-1", dimensions = 512);
     test:assertTrue(provider is ai:Error, "Titan V1 has no dimensions parameter");
 }
 
 @test:Config {}
 function testTitanAcceptsItsThreeSupportedWidths() returns error? {
     foreach int d in [256, 512, 1024] {
-        TitanEmbeddingProvider _ = check new (TEST_CREDS, TITAN_EMBED_TEXT_V2, "us-east-1", dimensions = d);
+        TitanEmbeddingProvider _ = check new (TITAN_EMBED_TEXT_V2, TEST_CREDS, "us-east-1", dimensions = d);
     }
 }
 
 @test:Config {}
 function testCohereV3RejectsDimensionsBecauseTheModelHasNone() {
-    CohereEmbeddingProvider|ai:Error provider = new (TEST_CREDS, COHERE_EMBED_ENGLISH_V3, "us-east-1",
+    CohereEmbeddingProvider|ai:Error provider = new (COHERE_EMBED_ENGLISH_V3, TEST_CREDS, "us-east-1",
             dimensions = 256);
     test:assertTrue(provider is ai:Error, "v3 has no output-size parameter — must not be silently dropped");
 }
 
 @test:Config {}
 function testCohereV4RejectsAnUnsupportedDimensions() {
-    CohereEmbeddingProvider|ai:Error provider = new (TEST_CREDS, COHERE_EMBED_V4, "us-east-1", dimensions = 999);
+    CohereEmbeddingProvider|ai:Error provider = new (COHERE_EMBED_V4, TEST_CREDS, "us-east-1", dimensions = 999);
     test:assertTrue(provider is ai:Error);
 }
 
 @test:Config {}
 function testCohereV4AcceptsItsSupportedWidths() returns error? {
     foreach int d in [256, 512, 1024, 1536] {
-        CohereEmbeddingProvider _ = check new (TEST_CREDS, COHERE_EMBED_V4, "us-east-1", dimensions = d);
+        CohereEmbeddingProvider _ = check new (COHERE_EMBED_V4, TEST_CREDS, "us-east-1", dimensions = d);
     }
 }
 
@@ -327,7 +327,7 @@ function testCohereV4AcceptsItsSupportedWidths() returns error? {
 function testCohereVersionSurvivesACrisGeoPrefix() {
     // REGRESSION: the provider passes the WIRE id (geo prefix restored) to the
     // version check. A raw startsWith("cohere.embed-v4") missed `us.`/`global.`
-    // prefixed ids and silently selected the v3 codec — wrong truncate spelling and
+    // prefixed ids and silently selected the v3 converter — wrong truncate spelling and
     // no output_dimension, with no error. Cohere Embed v4 is the one embedding
     // model AWS gives Geo AND Global inference ids.
     test:assertTrue(usesCohereEmbedV4("us.cohere.embed-v4:0"));
@@ -345,8 +345,8 @@ function testTitanV1GuardSurvivesACrisGeoPrefix() {
 }
 
 @test:Config {}
-function testCrisPrefixedCohereV4StillGetsTheV4Codec() returns error? {
+function testCrisPrefixedCohereV4StillGetsTheV4Converter() returns error? {
     // End-to-end through construction: a geo-prefixed v4 id must accept `dimensions`
     // (v3 rejects it) and reach the wire as `output_dimension`.
-    CohereEmbeddingProvider _ = check new (TEST_CREDS, "us.cohere.embed-v4:0", "us-east-1", dimensions = 256);
+    CohereEmbeddingProvider _ = check new ("us.cohere.embed-v4:0", TEST_CREDS, "us-east-1", dimensions = 256);
 }

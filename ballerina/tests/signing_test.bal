@@ -15,7 +15,7 @@
 import ballerina/test;
 import ballerina/time;
 
-// Golden tests for SigV4 signing (design §9.4).
+// Golden tests for SigV4 signing.
 //
 // `signedHeaders` is the highest-risk function in the module and had NO coverage —
 // which is exactly why an invalid-timestamp bug shipped (see the amzDate tests
@@ -34,7 +34,8 @@ final [string, string] FIXED_CLOCK = ["20260717T120000Z", "20260717"];
 
 function transportFor(string host, string path, string signingService, string region)
         returns BedrockTransport|error =>
-    new (TEST_CREDS_SIGNING, region, {host, path, signingService});
+    new (TEST_CREDS_SIGNING, region,
+        {baseUrl: string `https://${host}`, host, path, signingService});
 
 // Kept separate from TEST_CREDS so the golden signatures never move if that changes.
 final BedrockCredentials TEST_CREDS_SIGNING = {accessKeyId: "AKIATEST", secretAccessKey: "secret"};
@@ -83,9 +84,9 @@ function testSignedHeadersUseTheMantleScopeAndSignExtraHeaders() returns error? 
 
 @test:Config {}
 function testBearerCredentialsSkipSigV4Entirely() returns error? {
-    // A Bedrock API key is first-class on both endpoints (§9.5): no signature.
+    // A Bedrock API key is first-class on both endpoints: no signature.
     BedrockTransport transport = check new ({apiKey: "bedrock-api-key"}, "us-east-1",
-            {host: "bedrock-runtime.us-east-1.amazonaws.com", path: "/model/m/converse",
+            {baseUrl: string `https://bedrock-runtime.us-east-1.amazonaws.com`, host: "bedrock-runtime.us-east-1.amazonaws.com", path: "/model/m/converse",
                 signingService: SIGNING_BEDROCK});
     map<string> headers = check transport.signedHeaders("{}", {}, FIXED_CLOCK);
     test:assertEquals(headers["Authorization"], "Bearer bedrock-api-key");
@@ -101,7 +102,7 @@ function testBearerWithXApiKeyMantleRouteSendsOnlyXApiKey() returns error? {
     // Exactly one auth header may reach the wire. The merged set had no coverage, which is
     // how the collision shipped.
     BedrockTransport transport = check new ({apiKey: "bedrock-api-key"}, "us-east-1",
-            {host: "bedrock-mantle.us-east-1.api.aws", path: "/anthropic/v1/messages",
+            {baseUrl: string `https://bedrock-mantle.us-east-1.api.aws`, host: "bedrock-mantle.us-east-1.api.aws", path: "/anthropic/v1/messages",
                 signingService: SIGNING_BEDROCK_MANTLE});
     map<string> headers = check transport.signedHeaders("{}",
             {"x-api-key": "bedrock-api-key", "anthropic-version": "2023-06-01"}, FIXED_CLOCK);
@@ -116,7 +117,7 @@ function testBearerWithMixedCaseXApiKeyStillSuppressesAuthorization() returns er
     // `routeOverrides` entry using `X-Api-Key` must not slip past the guard and resurrect
     // both headers.
     BedrockTransport transport = check new ({apiKey: "bedrock-api-key"}, "us-east-1",
-            {host: "bedrock-mantle.us-east-1.api.aws", path: "/anthropic/v1/messages",
+            {baseUrl: string `https://bedrock-mantle.us-east-1.api.aws`, host: "bedrock-mantle.us-east-1.api.aws", path: "/anthropic/v1/messages",
                 signingService: SIGNING_BEDROCK_MANTLE});
     map<string> headers = check transport.signedHeaders("{}",
             {"X-Api-Key": "bedrock-api-key"}, FIXED_CLOCK);
@@ -131,7 +132,7 @@ function testStsCredentialsSignAndSendTheSecurityToken() returns error? {
     BedrockTransport transport = check new (
             {accessKeyId: "AKIATEST", secretAccessKey: "secret", sessionToken: "session-token-value"},
             "us-east-1",
-            {host: "bedrock-runtime.us-east-1.amazonaws.com", path: "/model/m/converse",
+            {baseUrl: string `https://bedrock-runtime.us-east-1.amazonaws.com`, host: "bedrock-runtime.us-east-1.amazonaws.com", path: "/model/m/converse",
                 signingService: SIGNING_BEDROCK});
     map<string> headers = check transport.signedHeaders("{}", {}, FIXED_CLOCK);
     test:assertEquals(headers["X-Amz-Security-Token"], "session-token-value");

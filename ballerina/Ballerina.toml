@@ -4,7 +4,7 @@ name = "ai.aws.bedrock"
 version = "0.9.0"
 distribution = "2201.12.0"
 authors = ["Ballerina"]
-keywords = ["ai", "aws", "bedrock", "llm", "embeddings", "converse", "mantle", "Area/AI & Machine Learning", "Type/Model Provider", "Type/Embedding Provider", "Type/Connector", "Vendor/AWS"]
+keywords = ["ai", "aws", "bedrock", "llm", "embeddings", "converse", "mantle", "knowledge base", "rag", "Area/AI & Machine Learning", "Type/Model Provider", "Type/Embedding Provider", "Type/Knowledge Base", "Type/Connector", "Vendor/AWS"]
 repository = "https://github.com/ballerina-platform/module-ballerinax-ai.aws.bedrock"
 license = ["Apache-2.0"]
 
@@ -22,6 +22,15 @@ org = "ballerina"
 name = "ai"
 version = "1.13.0"
 repository = "local"
+
+# Credential resolution (`aws.auth`) and endpoint metadata (`aws`). Signing stays
+# in-module: `auth:getSignedHeaders` always treats `/` as a path separator, so it
+# cannot produce the `%252F` a Bedrock model-id ARN needs in the canonical URI.
+# See the note above `signedHeaders` in transport.bal.
+[[dependency]]
+org = "ballerinax"
+name = "aws"
+version = "1.0.1"
 
 [platform.java21]
 graalvmCompatible = true

@@ -16,17 +16,17 @@ import ballerina/ai;
 
 // OpenAI `chat.completion.chunk` -> `ai:ChatCompletionChunk`.
 //
-// Serves FOUR codecs across BOTH wires, because the chunk object is the same
+// Serves FOUR converters across BOTH wires, because the chunk object is the same
 // wherever this dialect is spoken:
 //
-//   MANTLE_CHAT_CODEC            SSE on `/v1/chat/completions`   (GLM, Gemma 3, …)
-//   INVOKE_OPENAI_CHAT_CODEC     event-stream frames             (GPT-OSS, Qwen, DeepSeek V3.x)
-//   INVOKE_MISTRAL_CHAT_CODEC    event-stream frames             (Mistral Large 24.07)
+//   MANTLE_CHAT_CONVERTER            SSE on `/v1/chat/completions`   (GLM, Gemma 3, …)
+//   INVOKE_OPENAI_CHAT_CONVERTER     event-stream frames             (GPT-OSS, Qwen, DeepSeek V3.x)
+//   INVOKE_MISTRAL_CHAT_CONVERTER    event-stream frames             (Mistral Large 24.07)
 //
 // MISTRAL SHARES IT DESPITE HAVING ITS OWN CODEC. The two differ on the buffered
 // path in ways that matter — Mistral spells the stop reason `stop_reason`, forces
 // tools with the bare string `"any"`, and documents no `usage` block (see
-// codec_mistral.bal) — but a STREAMED chunk differs only in that spelling, which
+// converter_mistral.bal) — but a STREAMED chunk differs only in that spelling, which
 // `finish_reason ?: stop_reason` absorbs. A second decoder would be the same code
 // with one field name changed.
 //
@@ -77,7 +77,7 @@ class OpenAIChatStreamDecoder {
         // Usage rides the FINAL chunk, which carries an EMPTY `choices` array — so
         // what decides whether an event is worth emitting is the CONTENT it produced,
         // never the choice count. On Mantle usage appears only when the request asked
-        // for it (`stream_options: {include_usage: true}`, set by the codec); on
+        // for it (`stream_options: {include_usage: true}`, set by the converter); on
         // Invoke it arrives as Bedrock's own invocation metrics, which is the only
         // usage those vendors report at all.
         ai:CompletionTokenUsage? usage = openAIChatUsage(p) ?: invocationMetricsUsage(p);

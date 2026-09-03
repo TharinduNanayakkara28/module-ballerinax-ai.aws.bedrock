@@ -15,11 +15,17 @@
 import ballerina/ai;
 import ballerina/test;
 
-// Golden-file codec tests (design §13.2). Fixed messages in → asserted body out;
+// Golden-file converter tests. Fixed messages in → asserted body out;
 // canned response in → asserted DecodedResponse out.
 
-final ai:ChatMessage[] SAMPLE_MESSAGES = [{role: ai:USER, content: "Hello"}];
-final ai:ChatSystemMessage SAMPLE_SYSTEM = {role: ai:SYSTEM, content: "Be brief"};
+final ResolvedMessage[] & readonly SAMPLE_MESSAGES = [{parts: [{text: "Hello"}]}];
+final string SAMPLE_SYSTEM = "Be brief";
+
+// Encoders take ALREADY-RESOLVED messages (see content_parts.bal), so the golden
+// tests build them directly — no network, no credentials, exactly as before.
+isolated function userText(string text) returns ResolvedUserMessage => {parts: [{text}]};
+isolated function userImage(string mimeType, byte[] data) returns ResolvedUserMessage =>
+    {parts: [{mimeType, data}]};
 
 // ---- Converse encode ----
 
@@ -43,7 +49,7 @@ function testConversePerCallStopOverridesConfiguredStopSequences() returns error
     InferenceParams params = {temperature: 0.5, maxTokens: 100, stopSequences: ["CONFIGURED"]};
     map<json> body = check encodeConverse((), SAMPLE_MESSAGES, [], "PERCALL", params).ensureType();
     map<json> inferenceConfig = check body["inferenceConfig"].ensureType();
-    test:assertEquals(inferenceConfig["stopSequences"], <json>["PERCALL"], "per-call stop must win outright (§7)");
+    test:assertEquals(inferenceConfig["stopSequences"], <json>["PERCALL"], "per-call stop must win outright");
 }
 
 @test:Config {}
@@ -71,19 +77,19 @@ function testConverseGuardrailIsBodyField() returns error? {
 function testInvokeAnthropicEmitsBedrockVersionBodyField() returns error? {
     InferenceParams params = {temperature: 0.5, maxTokens: 100};
     map<json> body = check encodeInvokeAnthropic(SAMPLE_SYSTEM, SAMPLE_MESSAGES, [], (), params).ensureType();
-    test:assertEquals(body["anthropic_version"], "bedrock-2023-05-31", "§7.2 required body field");
-    test:assertEquals(body["system"], "Be brief", "system is top-level (§7.1)");
+    test:assertEquals(body["anthropic_version"], "bedrock-2023-05-31", "required body field");
+    test:assertEquals(body["system"], "Be brief", "system is top-level");
 }
 
 @test:Config {}
 function testMantleMessagesOmitsBedrockVersionBodyField() returns error? {
-    // §7.3: Mantle carries anthropic-version in the HEADER, not the body.
+    // Mantle carries anthropic-version in the HEADER, not the body.
     InferenceParams params = {temperature: 0.5, maxTokens: 100};
     map<json> body = check encodeMantleMessages(SAMPLE_SYSTEM, SAMPLE_MESSAGES, [], (), params).ensureType();
     test:assertFalse(body.hasKey("anthropic_version"), "Mantle must NOT emit the Invoke body version field");
 }
 
-// ---- Converse decode: usage + stopReason always populated (§7, §13.2) ----
+// ---- Converse decode: usage + stopReason always populated ----
 
 @test:Config {}
 function testConverseDecodePopulatesUsageAndStopReason() returns error? {
@@ -101,7 +107,7 @@ function testConverseDecodePopulatesUsageAndStopReason() returns error? {
 
 @test:Config {}
 function testConverseDecodeSurfacesGuardrailIntervention() returns error? {
-    // §9.5: never silently drop the fact a guardrail fired.
+    // never silently drop the fact a guardrail fired.
     json canned = {
         "output": {"message": {"role": "assistant", "content": [{"text": ""}]}},
         "stopReason": "guardrail_intervened",
@@ -151,7 +157,7 @@ function testAnthropicMessagesDecodePopulatesUsageStopReasonAndId() returns erro
 
 @test:Config {}
 function testInvokeAnthropicDecodeSurfacesBodyGuardrailAction() returns error? {
-    // §9.5 / InvokeModel API ref: the fired signal is a response-BODY field.
+    // InvokeModel API ref: the fired signal is a response-BODY field.
     json canned = {
         "id": "msg_gr",
         "role": "assistant",
@@ -195,7 +201,7 @@ function testMistralTextEncodesPromptNotMessages() returns error? {
 @test:Config {}
 function testMistralTextFoldsSystemIntoTheFirstInstructionBlock() returns error? {
     // The template has no system slot; system must never become a role:system
-    // message (§7.1), so it is prepended to the first [INST] block.
+    // message, so it is prepended to the first [INST] block.
     map<json> body = check encodeMistralText(SAMPLE_SYSTEM, SAMPLE_MESSAGES, [], (),
             {temperature: 0.5, maxTokens: 100}).ensureType();
     test:assertEquals(body["prompt"], <json>"<s>[INST] Be brief\n\nHello [/INST]");
@@ -203,10 +209,10 @@ function testMistralTextFoldsSystemIntoTheFirstInstructionBlock() returns error?
 
 @test:Config {}
 function testMistralTextRendersMultiTurnTemplate() returns error? {
-    ai:ChatMessage[] messages = [
-        {role: ai:USER, content: "First?"},
+    ResolvedMessage[] messages = [
+        userText("First?"),
         {role: ai:ASSISTANT, content: "Answer."},
-        {role: ai:USER, content: "Second?"}
+        userText("Second?")
     ];
     map<json> body = check encodeMistralText((), messages, [], (),
             {temperature: 0.5, maxTokens: 100}).ensureType();
@@ -226,7 +232,7 @@ function testMistralTextDecodePopulatesUsageAndStopReason() returns error? {
 
 @test:Config {}
 function testMistralChatDecodeReadsStopReasonNotFinishReason() returns error? {
-    // The regression that motivated splitting Mistral off the OpenAI codec: this
+    // The regression that motivated splitting Mistral off the OpenAI converter: this
     // dialect spells it `stop_reason`, so the OpenAI decoder left stopReason empty.
     json canned = {
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "stop_reason": "stop"}]
@@ -262,21 +268,18 @@ function testMistralDialectIsSelectedByModelId() returns error? {
 }
 
 @test:Config {}
-function testSelectInvokeCodecPicksTheRightMistralDialect() returns error? {
-    readonly & ModelCodec text = check selectInvokeCodec("mistral.mistral-7b-instruct-v0:2", ());
+function testSelectInvokeConverterPicksTheRightMistralDialect() returns error? {
+    readonly & ModelConverter text = check selectInvokeConverter("mistral.mistral-7b-instruct-v0:2");
     test:assertEquals(text.toolChoice, NO_TOOL_CHOICE);
-    readonly & ModelCodec chat = check selectInvokeCodec("mistral.mistral-large-2407-v1:0", ());
+    readonly & ModelConverter chat = check selectInvokeConverter("mistral.mistral-large-2407-v1:0");
     test:assertEquals(chat.toolChoice, MISTRAL_TOOL_CHOICE);
-    // modelSchema is the escape hatch when the id cannot say (imported ARNs).
-    readonly & ModelCodec forced = check selectInvokeCodec("my-imported-thing", MISTRAL_TEXT);
-    test:assertEquals(forced.toolChoice, NO_TOOL_CHOICE);
 }
 
 // ---- DeepSeek: text completion, not the OpenAI chat shape ----
 
 @test:Config {}
 function testDeepSeekInvokeEmitsPromptNotMessages() returns error? {
-    // REGRESSION: DeepSeek was routed to the OpenAI chat codec, which emits
+    // REGRESSION: DeepSeek was routed to the OpenAI chat converter, which emits
     // `messages` — a 400 on every DeepSeek Invoke request. AWS documents this
     // dialect as text completion.
     // https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-deepseek.html
@@ -309,13 +312,11 @@ function testDeepSeekRejectsToolsRatherThanDroppingThem() {
 }
 
 @test:Config {}
-function testDeepSeekSelectsItsOwnInvokeCodec() returns error? {
-    readonly & ModelCodec byPrefix = check selectInvokeCodec("deepseek.r1-v1:0", ());
+function testDeepSeekSelectsItsOwnInvokeConverter() returns error? {
+    readonly & ModelConverter byPrefix = check selectInvokeConverter("deepseek.r1-v1:0");
     test:assertEquals(byPrefix.toolChoice, NO_TOOL_CHOICE);
-    readonly & ModelCodec bySchema = check selectInvokeCodec("my-imported-deepseek", DEEPSEEK);
-    test:assertEquals(bySchema.toolChoice, NO_TOOL_CHOICE);
-    // GPT-OSS/Qwen keep the OpenAI chat codec.
-    readonly & ModelCodec openai = check selectInvokeCodec("openai.gpt-oss-120b-1:0", ());
+    // GPT-OSS/Qwen keep the OpenAI chat converter.
+    readonly & ModelConverter openai = check selectInvokeConverter("openai.gpt-oss-120b-1:0");
     test:assertEquals(openai.toolChoice, OPENAI_CHAT_TOOL_CHOICE);
 }
 
@@ -332,13 +333,13 @@ function testDeepSeekDialectIsSelectedByModelId() {
 
 @test:Config {}
 function testDeepSeekV32InvokeEmitsMessagesNotPrompt() returns error? {
-    // REGRESSION: every `deepseek.` id went to the text-completion codec, so
+    // REGRESSION: every `deepseek.` id went to the text-completion converter, so
     // INVOKE on deepseek.v3.2 sent `prompt` and Bedrock answered
     // `ValidationException ... missing field messages`.
     // https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-deepseek-deepseek-v3-2.html
-    readonly & ModelCodec codec = check selectInvokeCodec("deepseek.v3.2", ());
-    test:assertEquals(codec.toolChoice, OPENAI_CHAT_TOOL_CHOICE);
-    RequestCodec encode = codec.encode;
+    readonly & ModelConverter converter = check selectInvokeConverter("deepseek.v3.2");
+    test:assertEquals(converter.toolChoice, OPENAI_CHAT_TOOL_CHOICE);
+    RequestEncoder encode = converter.encode;
     map<json> body = check encode((), SAMPLE_MESSAGES, [], (),
             {temperature: 0.5, maxTokens: 100}).ensureType();
     test:assertTrue(body.hasKey("messages"));
@@ -433,7 +434,7 @@ function testResponsesDecodeDropsReasoningAndRefusalText() returns error? {
 
 @test:Config {}
 function testNovaPassthroughMergesIntoInferenceConfig() returns error? {
-    // Nova nests its inference knobs under a body key the codec also builds. A
+    // Nova nests its inference knobs under a body key the converter also builds. A
     // passthrough entry for that key used to REPLACE it, silently discarding the
     // caller's maxTokens/temperature/stopSequences.
     InferenceParams params = {
@@ -454,7 +455,7 @@ function testNovaPassthroughMergesIntoInferenceConfig() returns error? {
 @test:Config {}
 function testNovaPassthroughStillOverwritesNonNestedKeys() returns error? {
     // Only `inferenceConfig` merges; every other passthrough key keeps the
-    // existing overwrite behaviour shared with the other codecs.
+    // existing overwrite behaviour shared with the other converters.
     InferenceParams params = {
         temperature: 0.3,
         maxTokens: 256,
@@ -473,10 +474,10 @@ function testIntFieldRejectsAFractionalDecimal() {
             "a fractional token count is unusable and must be absent, not rounded to 2");
 }
 
-// ---- temperature is OMITTED when unset, on every codec ----
+// ---- temperature is OMITTED when unset, on every converter ----
 
 @test:Config {}
-function testTemperatureIsOmittedFromEveryCodecWhenUnset() returns error? {
+function testTemperatureIsOmittedFromEveryConverterWhenUnset() returns error? {
     // Not a cosmetic default. Claude 4.7+/Opus 5/Sonnet 5/Mythos 5 and OpenAI's
     // GPT-5.x reject `temperature` outright, so a module default made those model
     // ids return 400 on every single request. Unset MUST mean absent on the wire.
@@ -517,10 +518,100 @@ function testTemperatureIsStillEmittedWhenTheCallerSetsIt() returns error? {
 
 @test:Config {}
 function testBuildInferenceParamsDoesNotInventATemperature() {
-    InferenceParams none = buildInferenceParams((), (), (), (), (), (), (), (), ());
+    InferenceParams none = buildInferenceParams((), (), (), (), (), (), ());
     test:assertEquals(none?.temperature, (), "an unset temperature must stay unset");
     test:assertEquals(none.maxTokens, DEFAULT_MAX_TOKEN_COUNT, "maxTokens still defaults");
 
-    InferenceParams set = buildInferenceParams((), 0.9d, (), (), (), (), (), (), ());
+    InferenceParams set = buildInferenceParams((), 0.9d, (), (), (), (), ());
     test:assertEquals(set?.temperature, 0.9d);
+}
+
+// ---- the passthrough must stay OPEN ----
+
+@test:Config {}
+function testUnknownFutureFieldRidesThePassthroughVerbatim() returns error? {
+    // The scenario the open record exists for: AWS ships a parameter this module has
+    // never heard of. It must reach the wire with no module update — which is why
+    // `AdditionalRequestFields` is an OPEN record and not a closed one. A closed
+    // record would make this literal a compile error.
+    //
+    // Note the QUOTED keys: `{randomshit: 5}` does not compile, because identifiers
+    // cannot be used as rest-field keys.
+    AdditionalRequestFields newFields = {
+        "randomshit": 5,
+        "nested_thing": {"deep": ["a", "b"]},
+        "top_p": 0.9
+    };
+    InferenceParams params = buildInferenceParams(100, (), (), newFields, (), (), ());
+    map<json> body = check encodeConverse((), SAMPLE_MESSAGES, [], (), params).ensureType();
+
+    // Forwarded verbatim — not filtered, reshaped, or dropped.
+    test:assertEquals(body["additionalModelRequestFields"], <json>{
+        "randomshit": 5,
+        "nested_thing": {"deep": ["a", "b"]},
+        "top_p": 0.9
+    });
+}
+
+@test:Config {}
+function testVendorExtrasMergeIntoThePassthroughWithoutClobbering() returns error? {
+    // A vendor knob folded in by a facade must not wipe out what the caller set.
+    AdditionalRequestFields caller = {"randomshit": 5};
+    AdditionalRequestFields? merged = foldRequestFields(caller, {"enable_thinking": true});
+    if merged is () {
+        test:assertFail("fold must return the merged object");
+    }
+    test:assertEquals(merged["randomshit"], <json>5, "caller field survived the fold");
+    test:assertEquals(merged["enable_thinking"], <json>true, "vendor extra was added");
+}
+
+@test:Config {}
+function testAnydataRestValueIsConvertedRatherThanDropped() returns error? {
+    // `AdditionalRequestFields` is `record {}`, so its rest type is `anydata` — wider
+    // than json. A value with no direct JSON form must be CONVERTED at the wire
+    // boundary, never silently dropped and never a runtime failure: `toJson` is total.
+    AdditionalRequestFields odd = {"weird": xml `<p>hi</p>`, "normal": 1};
+    InferenceParams params = buildInferenceParams(100, (), (), odd, (), (), ());
+    map<json> body = check encodeConverse((), SAMPLE_MESSAGES, [], (), params).ensureType();
+    map<json> fwd = check body["additionalModelRequestFields"].ensureType();
+    test:assertEquals(fwd["normal"], <json>1, "json-shaped values pass through untouched");
+    test:assertEquals(fwd["weird"], <json>"<p>hi</p>", "xml degrades to its string form");
+}
+
+@test:Config {}
+function testEmptyPassthroughIsOmittedEntirely() returns error? {
+    // An empty object must not appear on the wire — some dialects reject it.
+    InferenceParams params = buildInferenceParams(100, (), (), {}, (), (), ());
+    map<json> body = check encodeConverse((), SAMPLE_MESSAGES, [], (), params).ensureType();
+    test:assertFalse(body.hasKey("additionalModelRequestFields"));
+}
+
+@test:Config {}
+function testConverseEffortFoldsIntoThePassthroughNotANativeMember() returns error? {
+    // Live-verified 2026-08-11: a native `outputConfig` member 400s on Converse —
+    // "This model doesn't support the effort field" — on every model tried,
+    // including opus-4-7 (on Anthropic's adaptive-only list, so not a "wrong
+    // model" 400). The identical value folded into
+    // additionalModelRequestFields.output_config.effort is accepted on the same
+    // model/route. See testLiveConverseEffortIsAccepted and
+    // converter_converse.bal's `effort` comment.
+    InferenceParams params = buildInferenceParams(100, (), (), (), (), (), (), (), EFFORT_LOW);
+    map<json> body = check encodeConverse((), SAMPLE_MESSAGES, [], (), params).ensureType();
+    test:assertFalse(body.hasKey("outputConfig"),
+            "effort must not ride a native outputConfig member — Bedrock rejects it");
+    map<json> extra = check body["additionalModelRequestFields"].ensureType();
+    test:assertEquals(extra["output_config"], <json>{"effort": "low"});
+}
+
+@test:Config {}
+function testConverseThinkingAndEffortFoldTogetherWithoutClobbering() returns error? {
+    // `thinking` and `effort` are folded into the same passthrough object in two
+    // separate steps (converter_converse.bal) — this locks in that the second fold
+    // doesn't wipe out the first.
+    InferenceParams params = buildInferenceParams(100, (), (), (), (), (), (),
+            {mode: ADAPTIVE}, EFFORT_HIGH);
+    map<json> body = check encodeConverse((), SAMPLE_MESSAGES, [], (), params).ensureType();
+    map<json> extra = check body["additionalModelRequestFields"].ensureType();
+    test:assertEquals(extra["thinking"], <json>{"type": "adaptive"});
+    test:assertEquals(extra["output_config"], <json>{"effort": "high"});
 }

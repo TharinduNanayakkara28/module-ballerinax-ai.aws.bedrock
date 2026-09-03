@@ -53,7 +53,7 @@ type StreamEventSource object {
 
 # Converts ONE native stream event into the normalized `ai:ChatCompletionChunk`.
 #
-# An OBJECT, not the plain function pointer the `encode`/`decode` codec members use,
+# An OBJECT, not the plain function pointer the `encode`/`decode` converter members use,
 # because a stream decoder is inherently stateful: tool-call fragments have to be
 # correlated across events, and the ordinal a caller sees must be derived from that
 # running state. One instance per `chatStream` call.
@@ -70,8 +70,8 @@ type StreamChunkDecoder object {
 
 # Which native stream dialect a route speaks.
 #
-# Carried on `ModelCodec.streamDialect`, so a route's dialect is settled by the same
-# selection that settles its codec — see the field's own note for why it is not
+# Carried on `ModelConverter.streamDialect`, so a route's dialect is settled by the same
+# selection that settles its converter — see the field's own note for why it is not
 # derived from the model id.
 #
 # The dialect is the EVENT MODEL, never the wire framing: `ANTHROPIC_STREAM` serves
@@ -81,7 +81,7 @@ type StreamChunkDecoder object {
 enum StreamDialect {
     # `ConverseStream` events — and Nova on `InvokeModelWithResponseStream`, whose
     # framed payloads are Converse-shaped (the same pairing that lets
-    # `INVOKE_NOVA_CODEC` reuse `decodeConverse`).
+    # `INVOKE_NOVA_CONVERTER` reuse `decodeConverse`).
     CONVERSE_STREAM,
     # Anthropic's own event model: `InvokeModelWithResponseStream` and Mantle Messages.
     ANTHROPIC_STREAM,
@@ -98,10 +98,10 @@ enum StreamDialect {
 
 # Which wire format frames a route's stream.
 #
-# Derived from the route FAMILY, not the codec, because it is a property of the
+# Derived from the route FAMILY, not the converter, because it is a property of the
 # ENDPOINT: everything on `bedrock-runtime` is event-stream framed and everything on
 # `bedrock-mantle` is SSE, whatever dialect rides inside. Deriving it here keeps the
-# one fact in one place — `selectCodec` already keys on the family, so the two
+# one fact in one place — `selectConverter` already keys on the family, so the two
 # cannot disagree.
 enum StreamWire {
     # `application/vnd.amazon.eventstream` — ConverseStream and

@@ -14,31 +14,31 @@
 
 import ballerina/ai;
 
-// Anthropic Messages wire format — shared by two routes (design §7.2, §7.3):
+// Anthropic Messages wire format — shared by two routes:
 //   * Invoke-Anthropic: `anthropic_version: bedrock-2023-05-31` BODY field.
 //   * Mantle Messages:  `anthropic-version: 2023-06-01` HEADER (added by the
-//     transport), NO body version field. Different value AND mechanism (§7.3).
+//     transport), NO body version field. Different value AND mechanism.
 // The response shape is identical, so `decode` is shared.
 
 // Invoke-Anthropic encoder — includes the mandatory `anthropic_version` body
-// field (design §7.2).
+// field.
 // https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html
-isolated function encodeInvokeAnthropic(ai:ChatSystemMessage? system, ai:ChatMessage[] messages,
+isolated function encodeInvokeAnthropic(string? system, ResolvedMessage[] messages,
         ai:ChatCompletionFunctions[] tools, string? stop, InferenceParams params) returns json|ai:Error
     => encodeAnthropicMessages(system, messages, tools, stop, params, true);
 
-// Mantle Messages encoder — NO body version field (the header carries it — §7.3).
-isolated function encodeMantleMessages(ai:ChatSystemMessage? system, ai:ChatMessage[] messages,
+// Mantle Messages encoder — NO body version field (the header carries it).
+isolated function encodeMantleMessages(string? system, ResolvedMessage[] messages,
         ai:ChatCompletionFunctions[] tools, string? stop, InferenceParams params) returns json|ai:Error
     => encodeAnthropicMessages(system, messages, tools, stop, params, false);
 
 // Builds an Anthropic Messages request body. `bedrockInvoke` toggles the required
-// `anthropic_version` body field (design §7.2 vs §7.3).
-isolated function encodeAnthropicMessages(ai:ChatSystemMessage? system, ai:ChatMessage[] messages,
+// `anthropic_version` body field.
+isolated function encodeAnthropicMessages(string? system, ResolvedMessage[] messages,
         ai:ChatCompletionFunctions[] tools, string? stop, InferenceParams params,
         boolean bedrockInvoke) returns json|ai:Error {
     json[] wire = [];
-    foreach ai:ChatMessage m in messages {
+    foreach ResolvedMessage m in messages {
         wire.push(anthropicMessage(m));
     }
     map<json> body = {
@@ -47,10 +47,10 @@ isolated function encodeAnthropicMessages(ai:ChatSystemMessage? system, ai:ChatM
     };
     setTemperature(body, params);
     if bedrockInvoke {
-        // REQUIRED for Invoke-Anthropic; LiteLLM injects the same default (§7.2).
+        // REQUIRED for Invoke-Anthropic; LiteLLM injects the same default.
         body["anthropic_version"] = "bedrock-2023-05-31";
     }
-    // Per-call `stop` overrides configured stopSequences outright (design §7).
+    // Per-call `stop` overrides configured stopSequences outright.
     string[]? stops = params.stopSequences;
     if stop is string {
         stops = [stop];
@@ -58,8 +58,8 @@ isolated function encodeAnthropicMessages(ai:ChatSystemMessage? system, ai:ChatM
     if stops is string[] && stops.length() > 0 {
         body["stop_sequences"] = stops;
     }
-    if system is ai:ChatSystemMessage {
-        body["system"] = contentToString(system.content); // top-level, never a message (§7.1)
+    if system is string {
+        body["system"] = system; // top-level, never a message
     }
     if tools.length() > 0 {
         json[] toolDefs = [];
@@ -68,13 +68,37 @@ isolated function encodeAnthropicMessages(ai:ChatSystemMessage? system, ai:ChatM
         }
         body["tools"] = toolDefs;
     }
+    // Native body fields on this dialect. `output_config` is a SIBLING of `thinking`
+    // — nesting `effort` inside `thinking` is a documented ValidationException.
+    // https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html
+    ThinkingConfig? thinking = params?.thinking;
+    if thinking is ThinkingConfig {
+        body["thinking"] = thinkingBody(thinking);
+    }
+    Effort? effort = params?.effort;
+    if effort is Effort {
+        body["output_config"] = {"effort": effort};
+    }
     return body;
 }
 
-// Maps one `ai:ChatMessage` to an Anthropic Messages content block (design §7.1).
-isolated function anthropicMessage(ai:ChatMessage m) returns json {
-    if m is ai:ChatUserMessage {
-        return {role: "user", content: [{"type": "text", "text": contentToString(m.content)}]};
+// `ThinkingConfig` -> its wire object. Kept in one place so the snake_case spelling
+// (`budget_tokens`) exists exactly once.
+isolated function thinkingBody(ThinkingConfig thinking) returns json {
+    map<json> out = {"type": thinking.mode};
+    int? budget = thinking?.budgetTokens;
+    if budget is int {
+        out["budget_tokens"] = budget;
+    }
+    return out;
+}
+
+// Maps one resolved message to an Anthropic Messages content block. Images use the
+// base64 `source`; Bedrock does NOT accept Anthropic's `url` source type
+// (https://platform.claude.com/docs/en/build-with-claude/vision).
+isolated function anthropicMessage(ResolvedMessage m) returns json {
+    if m is ResolvedUserMessage {
+        return {role: "user", content: anthropicContentBlocks(m.parts)};
     }
     if m is ai:ChatAssistantMessage {
         json[] blocks = [];
@@ -90,19 +114,15 @@ isolated function anthropicMessage(ai:ChatMessage m) returns json {
         }
         return {role: "assistant", content: blocks};
     }
-    if m is ai:ChatFunctionMessage {
-        // ai:FUNCTION result → Anthropic user-role tool_result block (§7.1).
-        return {
-            role: "user",
-            content: [{"type": "tool_result", "tool_use_id": m.id ?: m.name, "content": m.content ?: ""}]
-        };
-    }
-    // A ChatSystemMessage would have been hoisted (§7.1); handle defensively.
-    return {role: "user", content: [{"type": "text", "text": contentToString(m.content)}]};
+    // ai:FUNCTION result → Anthropic user-role tool_result block.
+    return {
+        role: "user",
+        content: [{"type": "tool_result", "tool_use_id": m.id ?: m.name, "content": m.content ?: ""}]
+    };
 }
 
 // Decodes an Anthropic Messages response (Invoke-Anthropic and Mantle Messages
-// share this shape — design §7). Always populates `usage` and `stopReason` (§7).
+// share this shape). Always populates `usage` and `stopReason`.
 isolated function decodeAnthropicMessages(json response) returns DecodedResponse|ai:Error {
     map<json>|error rr = response.ensureType();
     if rr is error {
@@ -136,7 +156,7 @@ isolated function decodeAnthropicMessages(json response) returns DecodedResponse
         outputTokens = intField(usage, "output_tokens") ?: 0;
     }
     // On the InvokeModel route a fired guardrail is a response-BODY field, not a
-    // header (design §9.5; InvokeModel API reference Example 4):
+    // header:
     // "amazon-bedrock-guardrailAction": "INTERVENED | NONE". Absent on Mantle.
     GuardrailAction? guardrailAction = ();
     string? action = strField(r, "amazon-bedrock-guardrailAction");
@@ -152,7 +172,6 @@ isolated function decodeAnthropicMessages(json response) returns DecodedResponse
         usage: {inputTokens, outputTokens},
         stopReason: strField(r, "stop_reason") ?: "end_turn",
         responseId: strField(r, "id"),
-        guardrailAction,
-        additionalModelResponseFields: ()
+        guardrailAction
     };
 }
