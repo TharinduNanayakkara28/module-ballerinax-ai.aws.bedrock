@@ -60,21 +60,21 @@ class FakeByteStream {
 }
 
 # Replays a canned chunk sequence, recording whether it was closed. Backs the
-# `ChunkTextIterator` propagation test.
+# `ChunkTextIterator` tests.
 class FakeChunkSource {
-    private final ai:ChatCompletionChunk[] chunks;
+    private final ai:ChatMessageChunk[] chunks;
     private int pos = 0;
     private boolean closed = false;
 
-    isolated function init(ai:ChatCompletionChunk[] chunks) {
+    isolated function init(ai:ChatMessageChunk[] chunks) {
         self.chunks = chunks;
     }
 
-    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+    public isolated function next() returns record {|ai:ChatMessageChunk value;|}|ai:Error? {
         if self.pos >= self.chunks.length() {
             return ();
         }
-        ai:ChatCompletionChunk chunk = self.chunks[self.pos];
+        ai:ChatMessageChunk chunk = self.chunks[self.pos];
         self.pos += 1;
         return {value: chunk};
     }
@@ -87,31 +87,46 @@ class FakeChunkSource {
     isolated function isClosed() returns boolean => self.closed;
 }
 
-# What draining a canned response produced: the chunks delivered, and the error the
-# stream ended with (`()` on a clean end).
+# What draining a canned response produced: the chunks delivered, the error the
+# stream ended with (`()` on a clean end), and what the iterator reported to its span.
 type DrainResult record {|
-    ai:ChatCompletionChunk[] chunks;
+    # Chunks delivered before the stream ended
+    ai:ChatMessageChunk[] chunks;
+    # The error the stream ended with
     ai:Error? err;
+    # Input tokens reported to the span
+    int inputTokens;
+    # Output tokens reported to the span
+    int outputTokens;
+    # Finish reason reported to the span
+    string finishReason;
 |};
 
-// Drains the iterator over a canned response, collecting chunks until it ends.
-function drainChunks(byte[] wire, StreamDialect dialect, boolean unwrapBytes, int readSize = 1)
-        returns DrainResult {
-    stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, readSize));
-    BedrockChunkIterator iterator = new (new EventStreamEventSource(bytes, unwrapBytes),
-            newStreamDecoder(dialect), "req-abc", "test.model-v1:0",
-            observe:createChatSpan("test.model-v1:0"));
-    ai:ChatCompletionChunk[] chunks = [];
+// Drains an iterator, collecting chunks until it ends.
+function drain(BedrockChunkIterator iterator) returns DrainResult {
+    ai:ChatMessageChunk[] chunks = [];
+    ai:Error? err = ();
     while true {
-        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = iterator.next();
-        if next is () {
-            return {chunks, err: ()};
-        }
+        record {|ai:ChatMessageChunk value;|}|ai:Error? next = iterator.next();
         if next is ai:Error {
-            return {chunks, err: next};
+            err = next;
+            break;
+        }
+        if next is () {
+            break;
         }
         chunks.push(next.value);
     }
+    return {chunks, err, inputTokens: iterator.inputTokens, outputTokens: iterator.outputTokens,
+        finishReason: iterator.finishReason};
+}
+
+// Drains the iterator over a canned event-stream response.
+function drainChunks(byte[] wire, StreamDialect dialect, boolean unwrapBytes, int readSize = 1)
+        returns DrainResult {
+    stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, readSize));
+    return drain(new (new EventStreamEventSource(bytes, unwrapBytes), newStreamDecoder(dialect), "req-abc",
+            observe:createChatSpan("test.model-v1:0")));
 }
 
 // Wraps a vendor event the way InvokeModelWithResponseStream does.
@@ -122,14 +137,22 @@ function invokeFrame(string eventJson) returns byte[] {
 }
 
 // Concatenates the text content across a whole chunk sequence.
-function textOf(ai:ChatCompletionChunk[] chunks) returns string {
+function textOf(ai:ChatMessageChunk[] chunks) returns string {
     string out = "";
-    foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            out += choice.delta.content ?: "";
-        }
+    foreach ai:ChatMessageChunk chunk in chunks {
+        out += chunk.content ?: "";
     }
     return out;
+}
+
+// Asserts the two per-chunk invariants of the contract: the assistant role on every
+// chunk, and one id stable across the whole response.
+function assertRoleAndIdOnEveryChunk(ai:ChatMessageChunk[] chunks, string expectedId) {
+    test:assertTrue(chunks.length() > 0, "the stream must produce chunks");
+    foreach ai:ChatMessageChunk chunk in chunks {
+        test:assertEquals(chunk.role, ai:ASSISTANT, "every chunk must carry the assistant role");
+        test:assertEquals(chunk?.id, expectedId, "every chunk must carry the same response id");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +160,7 @@ function textOf(ai:ChatCompletionChunk[] chunks) returns string {
 // ---------------------------------------------------------------------------
 
 @test:Config {}
-function testConverseStreamPipelineYieldsTextThenStopThenUsage() {
+function testConverseStreamPipelineYieldsTextThenStop() {
     byte[] wire = converseFrame("messageStart", "{\"role\":\"assistant\"}");
     wire.push(...converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"Hello \"}}"));
     wire.push(...converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"world\"}}"));
@@ -147,27 +170,22 @@ function testConverseStreamPipelineYieldsTextThenStopThenUsage() {
             "{\"usage\":{\"inputTokens\":5,\"outputTokens\":2,\"totalTokens\":7}}"));
 
     DrainResult result = drainChunks(wire, CONVERSE_STREAM, false);
-    ai:ChatCompletionChunk[] chunks = result.chunks;
-    ai:Error? err = result.err;
-    test:assertEquals(err, (), "a well-formed stream must end cleanly");
+    test:assertEquals(result.err, (), "a well-formed stream must end cleanly");
 
-    // messageStart + two deltas + messageStop + metadata = 5. contentBlockStop is
-    // skipped rather than surfaced as an empty chunk.
-    test:assertEquals(chunks.length(), 5);
+    // Two deltas + messageStop = 3. messageStart, contentBlockStop and the
+    // usage-only metadata event carry nothing for the caller and are skipped.
+    ai:ChatMessageChunk[] chunks = result.chunks;
+    test:assertEquals(chunks.length(), 3);
     test:assertEquals(textOf(chunks), "Hello world");
-    test:assertEquals(chunks[0].choices[0].delta.role, ai:ASSISTANT);
-    test:assertEquals(chunks[3].choices[0].finishReason, ai:STOP);
-    test:assertEquals((<ai:CompletionTokenUsage>chunks[4]?.usage)?.totalTokens, 7);
-}
+    test:assertEquals(chunks[2].finishReason, ai:STOP);
+    test:assertEquals(chunks[2].content, ());
+    // Converse events carry no completion id: the request id is stamped on every chunk.
+    assertRoleAndIdOnEveryChunk(chunks, "req-abc");
 
-@test:Config {}
-function testStreamPipelineBackfillsIdAndModel() {
-    // Converse events carry no completion id; the request id is the only value
-    // stable across every chunk, which is what the contract asks `id` to be.
-    byte[] wire = converseFrame("contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"x\"}}");
-    ai:ChatCompletionChunk[] chunks = drainChunks(wire, CONVERSE_STREAM, false).chunks;
-    test:assertEquals(chunks[0].id, "req-abc");
-    test:assertEquals(chunks[0].model, "test.model-v1:0");
+    // Usage and the finish reason reach the span.
+    test:assertEquals(result.inputTokens, 5);
+    test:assertEquals(result.outputTokens, 2);
+    test:assertEquals(result.finishReason, "stop");
 }
 
 @test:Config {}
@@ -183,16 +201,14 @@ function testStreamPipelineIsIndifferentToReadChunking() {
     int[] readSizes = [1, 3, 64, 4096];
     foreach int readSize in readSizes {
         DrainResult result = drainChunks(wire, CONVERSE_STREAM, false, readSize);
-        ai:ChatCompletionChunk[] chunks = result.chunks;
-        ai:Error? err = result.err;
-        test:assertEquals(err, (), string `read size ${readSize} must not fail`);
-        test:assertEquals(chunks.length(), 3, string `read size ${readSize} must yield 3 chunks`);
-        test:assertEquals(textOf(chunks), "abc", string `read size ${readSize} must recover the text`);
+        test:assertEquals(result.err, (), string `read size ${readSize} must not fail`);
+        test:assertEquals(result.chunks.length(), 2, string `read size ${readSize} must yield 2 chunks`);
+        test:assertEquals(textOf(result.chunks), "abc", string `read size ${readSize} must recover the text`);
     }
 }
 
 @test:Config {}
-function testConverseStreamPipelineReassemblesToolCallArguments() {
+function testConverseStreamPipelineStreamsToolCallFragmentsAcrossChunks() {
     byte[] wire = converseFrame("messageStart", "{\"role\":\"assistant\"}");
     wire.push(...converseFrame("contentBlockStart",
             "{\"contentBlockIndex\":0,\"start\":{\"toolUse\":{\"toolUseId\":\"tu_7\",\"name\":\"get_time\"}}}"));
@@ -203,30 +219,36 @@ function testConverseStreamPipelineReassemblesToolCallArguments() {
     wire.push(...converseFrame("messageStop", "{\"stopReason\":\"tool_use\"}"));
 
     DrainResult result = drainChunks(wire, CONVERSE_STREAM, false);
-    ai:ChatCompletionChunk[] chunks = result.chunks;
-    ai:Error? err = result.err;
-    test:assertEquals(err, ());
+    test:assertEquals(result.err, ());
+    ai:ChatMessageChunk[] chunks = result.chunks;
+    // One chunk per fragment: the opener, two argument fragments, the stop.
+    test:assertEquals(chunks.length(), 4);
+    assertRoleAndIdOnEveryChunk(chunks, "req-abc");
 
     // Accumulate exactly as a caller would: by tool-call index, across chunks.
     string name = "";
     string id = "";
     string arguments = "";
-    foreach ai:ChatCompletionChunk chunk in chunks {
-        ai:ToolCallChunk[]? calls = chunk.choices[0].delta.toolCalls;
+    int fragments = 0;
+    foreach ai:ChatMessageChunk chunk in chunks {
+        ai:ToolCallChunk[]? calls = chunk.toolCalls;
         if calls is () {
             continue;
         }
         foreach ai:ToolCallChunk call in calls {
             test:assertEquals(call.index, 0);
+            fragments += 1;
             id = call?.id ?: id;
-            name = call?.'function?.name ?: name;
-            arguments += call?.'function?.arguments ?: "";
+            name = call?.name ?: name;
+            arguments += call?.arguments ?: "";
         }
     }
+    test:assertEquals(fragments, 3);
     test:assertEquals(id, "tu_7");
     test:assertEquals(name, "get_time");
     test:assertEquals(arguments, "{\"tz\":\"UTC\"}", "the argument fragments must reassemble into valid JSON");
-    test:assertEquals(chunks[chunks.length() - 1].choices[0].finishReason, ai:TOOL_CALLS);
+    test:assertEquals(chunks[3].finishReason, ai:TOOL_CALLS);
+    test:assertEquals(result.finishReason, "tool_calls");
 }
 
 // ---------------------------------------------------------------------------
@@ -244,24 +266,47 @@ function testAnthropicInvokeStreamPipelineUnwrapsAndDecodes() {
     wire.push(...invokeFrame("{\"type\":\"ping\"}"));
     wire.push(...invokeFrame("{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}," +
                 "\"usage\":{\"output_tokens\":4}}"));
+    wire.push(...invokeFrame("{\"type\":\"message_stop\"}"));
 
     DrainResult result = drainChunks(wire, ANTHROPIC_STREAM, true);
-    ai:ChatCompletionChunk[] chunks = result.chunks;
-    ai:Error? err = result.err;
-    test:assertEquals(err, ());
-    test:assertEquals(textOf(chunks), "Bonjour");
-    // `ping` produced nothing: message_start + 2 deltas + message_delta = 4.
-    test:assertEquals(chunks.length(), 4);
-    // The dialect supplied its own id, so the request-id backfill must not override it.
-    test:assertEquals(chunks[0].id, "msg_1");
-    test:assertEquals(chunks[0].model, "claude-x");
-    test:assertEquals(chunks[3].choices[0].finishReason, ai:STOP);
-    // Both halves of usage land together on the final chunk, with the derived total.
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunks[3]?.usage;
-    test:assertEquals(usage?.promptTokens, 11);
-    test:assertEquals(usage?.completionTokens, 4);
-    test:assertEquals(usage?.totalTokens, 15);
-    test:assertEquals(chunks[0]?.usage, (), "the opening chunk carries no partial usage");
+    test:assertEquals(result.err, ());
+    test:assertEquals(textOf(result.chunks), "Bonjour");
+    // message_start, ping and message_stop produce nothing: 2 deltas + message_delta = 3.
+    test:assertEquals(result.chunks.length(), 3);
+    // The message id from message_start is stamped on EVERY chunk — including the
+    // ones built from events that do not repeat it — and wins over the request id.
+    assertRoleAndIdOnEveryChunk(result.chunks, "msg_1");
+    test:assertEquals(result.chunks[2].finishReason, ai:STOP);
+    // The two halves of usage arrive on different events; both reach the span.
+    test:assertEquals(result.inputTokens, 11);
+    test:assertEquals(result.outputTokens, 4);
+    test:assertEquals(result.finishReason, "stop");
+}
+
+@test:Config {}
+function testEveryChunkCarriesTheRoleWhateverItHolds() {
+    // Reasoning, text, a tool call and a finish-only chunk from one response: the
+    // role and the id are on all of them, not only on the first.
+    byte[] wire = invokeFrame("{\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\"}}");
+    wire.push(...invokeFrame("{\"type\":\"content_block_delta\",\"index\":0," +
+                "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}"));
+    wire.push(...invokeFrame("{\"type\":\"content_block_delta\",\"index\":1," +
+                "\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me check.\"}}"));
+    wire.push(...invokeFrame("{\"type\":\"content_block_start\",\"index\":2," +
+                "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\",\"input\":{}}}"));
+    wire.push(...invokeFrame("{\"type\":\"content_block_delta\",\"index\":2," +
+                "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}"));
+    wire.push(...invokeFrame("{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}"));
+
+    DrainResult result = drainChunks(wire, ANTHROPIC_STREAM, true);
+    test:assertEquals(result.err, ());
+    test:assertEquals(result.chunks.length(), 5);
+    assertRoleAndIdOnEveryChunk(result.chunks, "msg_2");
+    test:assertEquals(result.chunks[0].reasoning, "hmm");
+    test:assertEquals(result.chunks[1].content, "Let me check.");
+    test:assertEquals(result.chunks[2].toolCalls, [{index: 0, id: "toolu_1", name: "lookup"}]);
+    test:assertEquals(result.chunks[3].toolCalls, [{index: 0, arguments: "{}"}]);
+    test:assertEquals(result.chunks[4].finishReason, ai:TOOL_CALLS);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,10 +338,9 @@ function testStreamPipelineSurfacesAnExceptionFrame() {
             }, "{\"message\":\"upstream model failed\"}"));
 
     DrainResult result = drainChunks(wire, CONVERSE_STREAM, false);
-    ai:ChatCompletionChunk[] chunks = result.chunks;
-    ai:Error? err = result.err;
     // The chunks that already arrived are still delivered; the failure lands after.
-    test:assertEquals(textOf(chunks), "hi");
+    test:assertEquals(textOf(result.chunks), "hi");
+    ai:Error? err = result.err;
     if err !is ai:Error {
         test:assertFail("an exception frame must surface an error");
     }
@@ -307,11 +351,18 @@ function testStreamPipelineSurfacesAnExceptionFrame() {
 @test:Config {}
 function testStreamPipelineRejectsAnInvokeFrameWithoutBytes() {
     // An Invoke frame is always `{"bytes": base64}`; anything else means the route
-    // and the dialect have been paired wrongly.
+    // and the dialect have been paired wrongly — a malformed chunk.
     byte[] wire = buildFrame({[HDR_MESSAGE_TYPE]: "event", [HDR_EVENT_TYPE]: "chunk"},
             "{\"unexpected\":true}");
     ai:Error? err = drainChunks(wire, ANTHROPIC_STREAM, true).err;
-    test:assertTrue(err is ai:Error, "a frame with no 'bytes' member must error");
+    test:assertTrue(err is ai:LlmInvalidResponseError, "a frame with no 'bytes' member must be an invalid response");
+}
+
+@test:Config {}
+function testStreamPipelineReportsAMalformedPayloadAsAnInvalidResponse() {
+    byte[] wire = converseFrame("contentBlockDelta", "{not json");
+    ai:Error? err = drainChunks(wire, CONVERSE_STREAM, false).err;
+    test:assertTrue(err is ai:LlmInvalidResponseError, "an unparseable payload must be an invalid response");
 }
 
 // ---------------------------------------------------------------------------
@@ -342,10 +393,11 @@ function testAMantleRoutedModelResolvesAStreamingRouteWithoutABodyRewrite() retu
 
 @test:Config {}
 function testTheStreamingGuardStillRefusesACodecWithoutADialect() {
-    // Every shipped converter streams, so the guard in `runChatStream` is unreachable
-    // today — but it is what keeps a future converter that this module can encode and
-    // cannot decode incrementally from returning a silent, empty stream instead of an
-    // error. Pinned at the field, since no route can exercise it any more.
+    // Every shipped converter streams, so the guard in `openChunkStream` is
+    // unreachable today — but it is what keeps a future converter that this module
+    // can encode and cannot decode incrementally from returning a silent, empty
+    // stream instead of an error. Pinned at the field, since no route can exercise it
+    // any more.
     readonly & ModelConverter unstreamable = {
         encode: encodeConverse,
         decode: decodeConverse,
@@ -353,19 +405,6 @@ function testTheStreamingGuardStillRefusesACodecWithoutADialect() {
         streamDialect: ()
     };
     test:assertTrue(unstreamable.streamDialect is (), "the guard reads exactly this");
-}
-
-@test:Config {}
-function testGenerateStreamRejectsANonStringTargetType() {
-    // Structured output cannot stream: the typed value comes out of a forced tool
-    // call whose arguments are only bindable once the whole JSON has arrived.
-    AnthropicModelProvider provider = checkpanic new (CLAUDE_SONNET_5, TEST_CREDS, REGION,
-            config = {apiFamily: CONVERSE});
-    stream<FruitShape, ai:Error?>|ai:Error typed = provider->generateStream(`Name a fruit.`);
-    if typed !is ai:Error {
-        test:assertFail("generateStream with a record target must be refused");
-    }
-    test:assertTrue(typed.message().includes("only 'string'"), typed.message());
 }
 
 // ---------------------------------------------------------------------------
@@ -384,12 +423,12 @@ function testClosingAPartiallyReadStreamReleasesTheResponseBody() returns error?
 
     FakeByteStream body = new (wire, 1);
     stream<byte[], io:Error?> bytes = new (body);
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+    stream<ai:ChatMessageChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
             new EventStreamEventSource(bytes, false), newStreamDecoder(CONVERSE_STREAM),
-            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0")));
+            "req-abc", observe:createChatSpan("test.model-v1:0")));
 
-    record {|ai:ChatCompletionChunk value;|}? first = check chunks.next();
-    test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "the first chunk must arrive");
+    record {|ai:ChatMessageChunk value;|}? first = check chunks.next();
+    test:assertTrue(first is record {|ai:ChatMessageChunk value;|}, "the first chunk must arrive");
     test:assertEquals(body.closes(), 0, "reading must not close the body");
 
     check chunks.close();
@@ -404,9 +443,9 @@ function testClosingAnExhaustedStreamIsANoOp() returns error? {
     byte[] wire = converseFrame("messageStop", "{\"stopReason\":\"end_turn\"}");
     FakeByteStream body = new (wire, 1);
     stream<byte[], io:Error?> bytes = new (body);
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+    stream<ai:ChatMessageChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
             new EventStreamEventSource(bytes, false), newStreamDecoder(CONVERSE_STREAM),
-            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0")));
+            "req-abc", observe:createChatSpan("test.model-v1:0")));
 
     _ = check chunks.next(); // messageStop
     test:assertEquals(check chunks.next(), (), "the stream must end after its last frame");
@@ -428,11 +467,11 @@ function testClosingAFailedStreamStillReleasesTheResponseBody() returns error? {
 
     FakeByteStream body = new (wire, 1);
     stream<byte[], io:Error?> bytes = new (body);
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+    stream<ai:ChatMessageChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
             new EventStreamEventSource(bytes, false), newStreamDecoder(CONVERSE_STREAM),
-            "req-abc", "test.model-v1:0", observe:createChatSpan("test.model-v1:0")));
+            "req-abc", observe:createChatSpan("test.model-v1:0")));
 
-    record {|ai:ChatCompletionChunk value;|}|ai:Error? first = chunks.next();
+    record {|ai:ChatMessageChunk value;|}|ai:Error? first = chunks.next();
     test:assertTrue(first is ai:Error, "an exception frame must surface as an error");
 
     check chunks.close();
@@ -440,20 +479,28 @@ function testClosingAFailedStreamStillReleasesTheResponseBody() returns error? {
 }
 
 @test:Config {}
-function testClosingTheGenerateStreamTextStreamPropagates() returns error? {
-    // `generateStream` hands back a text stream wrapping the chunk stream. Without a
-    // `close()` on the projection, `BedrockChunkIterator.close()` is unreachable
-    // from a `generateStream` caller and the release above never happens.
+function testTheTextProjectionYieldsOnlyContentAndPropagatesClose() returns error? {
+    // `generateAsStream` hands back a text stream over the chunk stream. It must
+    // yield the answer text only, and its `close()` must reach the chunk stream —
+    // otherwise `BedrockChunkIterator.close()` is unreachable from a
+    // `generateAsStream` caller and the release above never happens.
     FakeChunkSource chunkSource = new ([
-        singleChoiceChunk({content: "Hello "}),
-        singleChoiceChunk({content: "world"})
+        {role: ai:ASSISTANT, reasoning: "thinking first"},
+        {role: ai:ASSISTANT, content: "Hello "},
+        {role: ai:ASSISTANT, toolCalls: [{index: 0, id: "t1", name: "lookup"}]},
+        {role: ai:ASSISTANT, content: ""},
+        {role: ai:ASSISTANT, content: "world"},
+        {role: ai:ASSISTANT, finishReason: ai:STOP}
     ]);
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (chunkSource);
+    stream<ai:ChatMessageChunk, ai:Error?> chunks = new (chunkSource);
     stream<string, ai:Error?> text = new (new ChunkTextIterator(chunks));
 
     record {|string value;|}? first = check text.next();
-    test:assertEquals(first?.value, "Hello ");
+    test:assertEquals(first?.value, "Hello ", "reasoning must be skipped");
     test:assertFalse(chunkSource.isClosed(), "reading must not close the chunk stream");
+    record {|string value;|}? second = check text.next();
+    test:assertEquals(second?.value, "world", "tool-call and empty chunks must be skipped");
+    test:assertEquals(check text.next(), (), "the finish-only chunk yields nothing");
 
     check text.close();
     test:assertTrue(chunkSource.isClosed(), "close() must propagate to the chunk stream underneath");
@@ -473,11 +520,10 @@ function testAFailedStreamStaysEnded() {
 
     stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, 1));
     BedrockChunkIterator iterator = new (new EventStreamEventSource(bytes, false),
-            newStreamDecoder(CONVERSE_STREAM), "req-abc", "test.model-v1:0",
-            observe:createChatSpan("test.model-v1:0"));
+            newStreamDecoder(CONVERSE_STREAM), "req-abc", observe:createChatSpan("test.model-v1:0"));
 
-    record {|ai:ChatCompletionChunk value;|}|ai:Error? first = iterator.next();
-    test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "the text before the exception arrives");
+    record {|ai:ChatMessageChunk value;|}|ai:Error? first = iterator.next();
+    test:assertTrue(first is record {|ai:ChatMessageChunk value;|}, "the text before the exception arrives");
     test:assertTrue(iterator.next() is ai:Error, "the exception frame surfaces as an error");
 
     test:assertTrue(iterator.next() is (), "a failed stream must stay ended");
@@ -493,10 +539,9 @@ function testAClosedStreamStopsYielding() returns error? {
 
     stream<byte[], io:Error?> bytes = new (new FakeByteStream(wire, 1));
     BedrockChunkIterator iterator = new (new EventStreamEventSource(bytes, false),
-            newStreamDecoder(CONVERSE_STREAM), "req-abc", "test.model-v1:0",
-            observe:createChatSpan("test.model-v1:0"));
+            newStreamDecoder(CONVERSE_STREAM), "req-abc", observe:createChatSpan("test.model-v1:0"));
 
-    test:assertTrue(iterator.next() is record {|ai:ChatCompletionChunk value;|}, "the first chunk arrives");
+    test:assertTrue(iterator.next() is record {|ai:ChatMessageChunk value;|}, "the first chunk arrives");
     check iterator.close();
     test:assertTrue(iterator.next() is (), "a closed stream must not resume");
 }
@@ -540,19 +585,8 @@ class FakeSseStream {
 // Drains a canned SSE response through the whole pipeline.
 function drainSse(http:SseEvent[] events, StreamDialect dialect) returns DrainResult {
     stream<http:SseEvent, error?> sse = new (new FakeSseStream(events));
-    BedrockChunkIterator iterator = new (new SseEventSource(sse), newStreamDecoder(dialect),
-            "req-mantle", "anthropic.claude-sonnet-5", observe:createChatSpan("anthropic.claude-sonnet-5"));
-    ai:ChatCompletionChunk[] chunks = [];
-    while true {
-        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = iterator.next();
-        if next is () {
-            return {chunks, err: ()};
-        }
-        if next is ai:Error {
-            return {chunks, err: next};
-        }
-        chunks.push(next.value);
-    }
+    return drain(new (new SseEventSource(sse), newStreamDecoder(dialect), "req-mantle",
+            observe:createChatSpan("anthropic.claude-sonnet-5")));
 }
 
 @test:Config {}
@@ -576,11 +610,10 @@ function testMantleMessagesSsePipelineDecodesWithTheAnthropicDecoder() {
 
     test:assertTrue(result.err is (), "a well-formed SSE response must end cleanly");
     test:assertEquals(textOf(result.chunks), "Hi there");
-    ai:ChatCompletionChunk last = result.chunks[result.chunks.length() - 1];
-    test:assertEquals(last.choices[0].finishReason, ai:STOP);
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>last?.usage;
-    test:assertEquals(usage.promptTokens, 9, "the prompt half is stashed from message_start");
-    test:assertEquals(usage.completionTokens, 4);
+    assertRoleAndIdOnEveryChunk(result.chunks, "msg_1");
+    test:assertEquals(result.chunks[result.chunks.length() - 1].finishReason, ai:STOP);
+    test:assertEquals(result.inputTokens, 9, "the input half arrives on message_start");
+    test:assertEquals(result.outputTokens, 4);
 }
 
 @test:Config {}
@@ -589,28 +622,25 @@ function testMantleChatSsePipelineStopsAtTheDoneSentinel() {
     // that in fact completed perfectly.
     FakeSseStream body = new ([
         {data: "{\"id\":\"chatcmpl-1\",\"model\":\"zai.glm-5\"," +
-                "\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"},
-        {data: "{\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}"},
+                "\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}"},
+        {data: "{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}"},
+        {data: "{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}"},
+        {data: "{\"id\":\"chatcmpl-1\",\"choices\":[]," +
+                "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}"},
         {data: "[DONE]"}
     ]);
     stream<http:SseEvent, error?> sse = new (body);
-    BedrockChunkIterator iterator = new (new SseEventSource(sse), newStreamDecoder(OPENAI_CHAT_STREAM),
-            "req-mantle", "zai.glm-5", observe:createChatSpan("zai.glm-5"));
+    DrainResult result = drain(new (new SseEventSource(sse), newStreamDecoder(OPENAI_CHAT_STREAM),
+            "req-mantle", observe:createChatSpan("zai.glm-5")));
 
-    ai:ChatCompletionChunk[] chunks = [];
-    while true {
-        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = iterator.next();
-        if next is () {
-            break;
-        }
-        if next is ai:Error {
-            test:assertFail(next.message());
-        }
-        chunks.push(next.value);
-    }
-    test:assertEquals(textOf(chunks), "ok");
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunks[chunks.length() - 1]?.usage;
-    test:assertEquals(usage.totalTokens, 6);
+    test:assertEquals(result.err, ());
+    // The role-only opener and the usage-only closer carry nothing for the caller.
+    test:assertEquals(result.chunks.length(), 2);
+    test:assertEquals(textOf(result.chunks), "ok");
+    assertRoleAndIdOnEveryChunk(result.chunks, "chatcmpl-1");
+    test:assertEquals(result.chunks[1].finishReason, ai:STOP);
+    test:assertEquals(result.inputTokens, 5);
+    test:assertEquals(result.outputTokens, 1);
     // The sentinel ends the stream mid-body, so the connection is released there
     // rather than left for a caller that has no reason to call `close()`.
     test:assertEquals(body.closes(), 1, "[DONE] must release the response");
@@ -632,10 +662,11 @@ function testMantleResponsesSsePipelineDecodesTheLifecycle() {
 
     test:assertTrue(result.err is ());
     test:assertEquals(textOf(result.chunks), "Once upon");
-    test:assertEquals(result.chunks[0].id, "resp_9", "the dialect's own id survives the backfill");
-    ai:ChatCompletionChunk last = result.chunks[result.chunks.length() - 1];
-    test:assertEquals(last.choices[0].finishReason, ai:STOP);
-    test:assertEquals((<ai:CompletionTokenUsage>last?.usage).totalTokens, 10);
+    // `response.created` yields no chunk, but its id is on every chunk after it.
+    assertRoleAndIdOnEveryChunk(result.chunks, "resp_9");
+    test:assertEquals(result.chunks[result.chunks.length() - 1].finishReason, ai:STOP);
+    test:assertEquals(result.inputTokens, 8);
+    test:assertEquals(result.outputTokens, 2);
 }
 
 @test:Config {}
@@ -703,12 +734,12 @@ function testClosingAPartiallyReadSseStreamReleasesTheResponse() returns error? 
                     "\"delta\":{\"type\":\"text_delta\",\"text\":\"b\"}}"}
     ]);
     stream<http:SseEvent, error?> sse = new (body);
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+    stream<ai:ChatMessageChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
             new SseEventSource(sse), newStreamDecoder(ANTHROPIC_STREAM), "req-mantle",
-            "anthropic.claude-sonnet-5", observe:createChatSpan("anthropic.claude-sonnet-5")));
+            observe:createChatSpan("anthropic.claude-sonnet-5")));
 
-    record {|ai:ChatCompletionChunk value;|}? first = check chunks.next();
-    test:assertTrue(first is record {|ai:ChatCompletionChunk value;|}, "the first chunk must arrive");
+    record {|ai:ChatMessageChunk value;|}? first = check chunks.next();
+    test:assertTrue(first is record {|ai:ChatMessageChunk value;|}, "the first chunk must arrive");
     test:assertEquals(body.closes(), 0, "reading must not close the body");
 
     check chunks.close();

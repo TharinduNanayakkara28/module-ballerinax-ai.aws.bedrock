@@ -14,7 +14,7 @@
 
 import ballerina/ai;
 
-// OpenAI Responses stream events -> `ai:ChatCompletionChunk`. Mantle only
+// OpenAI Responses stream events -> `ai:ChatMessageChunk`. Mantle only
 // (`/openai/v1/responses` for GPT-5.x and Gemma 4, `/v1/responses` elsewhere).
 //
 // STRUCTURALLY UNLIKE THE OTHER DIALECTS. The rest stream DELTAS of one implicit
@@ -66,20 +66,23 @@ class ResponsesStreamDecoder {
     // model wants a tool run from one that simply finished talking.
     private boolean sawToolCall = false;
 
-    isolated function decode(string eventType, json payload) returns ai:ChatCompletionChunk|ai:Error? {
+    isolated function decode(string eventType, json payload) returns StreamUpdate|ai:Error? {
         map<json> p = payload is map<json> ? payload : {};
         string 'type = strField(p, "type") ?: eventType;
 
         match 'type {
             RESPONSES_EVT_CREATED => {
-                return self.decodeCreated(p);
+                // The opening event names the response; nothing in it is for the
+                // caller, but its id is stamped on every later chunk.
+                map<json>? response = mapField(p, "response");
+                string? id = response is map<json> ? strField(response, "id") : ();
+                return id is string ? {responseId: id} : ();
             }
             RESPONSES_EVT_OUTPUT_ITEM_ADDED => {
                 return self.decodeItemAdded(p);
             }
             RESPONSES_EVT_OUTPUT_TEXT_DELTA => {
-                string? text = strField(p, "delta");
-                return text is string ? singleChoiceChunk({content: text}) : ();
+                return contentUpdate(strField(p, "delta"));
             }
             RESPONSES_EVT_FUNCTION_ARGS_DELTA => {
                 return self.decodeArgumentsDelta(p);
@@ -88,8 +91,7 @@ class ResponsesStreamDecoder {
                 // GPT-5.x returns a SUMMARY of its reasoning, not the raw trace —
                 // readable text either way, so it populates `reasoning` exactly as
                 // Claude's thinking does. It never joins `content`.
-                string? reasoning = strField(p, "delta");
-                return reasoning is string ? singleChoiceChunk({reasoning}) : ();
+                return reasoningUpdate(strField(p, "delta"));
             }
             RESPONSES_EVT_COMPLETED|RESPONSES_EVT_INCOMPLETE => {
                 return self.decodeTerminal(p);
@@ -105,87 +107,50 @@ class ResponsesStreamDecoder {
         return ();
     }
 
-    // `response.created` opens the stream with the response object: the id a caller
-    // should see on every chunk, and the model that actually served the request.
-    private isolated function decodeCreated(map<json> p) returns ai:ChatCompletionChunk? {
-        ai:ChatCompletionChunk chunk = singleChoiceChunk({role: ai:ASSISTANT});
-        map<json>? response = mapField(p, "response");
-        if response is () {
-            return chunk;
-        }
-        string? id = strField(response, "id");
-        if id is string {
-            chunk.id = id;
-        }
-        string? model = strField(response, "model");
-        if model is string {
-            chunk.model = model;
-        }
-        return chunk;
-    }
-
     // `response.output_item.added` is the ONLY event carrying a tool call's id and
     // name; the arguments arrive later, on their own events. A `message` or
     // `reasoning` item has nothing to announce — its content streams as deltas.
-    private isolated function decodeItemAdded(map<json> p) returns ai:ChatCompletionChunk? {
+    private isolated function decodeItemAdded(map<json> p) returns StreamUpdate? {
         map<json>? item = mapField(p, "item");
         if item is () || strField(item, "type") != "function_call" {
             return ();
         }
         self.sawToolCall = true;
-        ai:ToolCallChunk chunk = {
-            index: self.toolIndex.indexFor(intField(p, "output_index") ?: 0),
-            // `call_id` is what a tool RESULT must be addressed to; `id` is the
-            // item's own handle. The contract wants the former.
-            id: strField(item, "call_id") ?: strField(item, "id"),
-            'function: {name: strField(item, "name")}
-        };
-        return singleChoiceChunk({toolCalls: [chunk]});
+        // `call_id` is what a tool RESULT must be addressed to; `id` is the item's
+        // own handle. The contract wants the former.
+        return toolCallUpdate(toolCallChunk(self.toolIndex.indexFor(intField(p, "output_index") ?: 0),
+                id = strField(item, "call_id") ?: strField(item, "id"), name = strField(item, "name")));
     }
 
     // Tool arguments as partial JSON, keyed by the same item ordinal the opening
     // `output_item.added` used, so a caller can join the two halves.
-    private isolated function decodeArgumentsDelta(map<json> p) returns ai:ChatCompletionChunk? {
+    private isolated function decodeArgumentsDelta(map<json> p) returns StreamUpdate? {
         string? partial = strField(p, "delta");
-        if partial is () {
+        if partial is () || partial == "" {
             return ();
         }
         self.sawToolCall = true;
-        ai:ToolCallChunk chunk = {
-            index: self.toolIndex.indexFor(intField(p, "output_index") ?: 0),
-            'function: {arguments: partial}
-        };
-        return singleChoiceChunk({toolCalls: [chunk]});
+        return toolCallUpdate(toolCallChunk(self.toolIndex.indexFor(intField(p, "output_index") ?: 0),
+                arguments = partial));
     }
 
     // `response.completed` / `.incomplete` close the stream with the finished
     // response object, which is where `usage` lives.
-    private isolated function decodeTerminal(map<json> p) returns ai:ChatCompletionChunk? {
+    private isolated function decodeTerminal(map<json> p) returns StreamUpdate? {
         map<json> response = mapField(p, "response") ?: {};
-        ai:ChatCompletionChunk chunk = singleChoiceChunk({},
-                responsesFinishReason(response, self.sawToolCall));
+        StreamUpdate update = {};
+        ai:FinishReason? finishReason = responsesFinishReason(response, self.sawToolCall);
+        if finishReason is ai:FinishReason {
+            update.chunk = {role: ai:ASSISTANT, finishReason};
+        }
         map<json>? usage = mapField(response, "usage");
         if usage is map<json> {
-            ai:CompletionTokenUsage mapped = {};
-            int? inputTokens = intField(usage, "input_tokens");
-            int? outputTokens = intField(usage, "output_tokens");
-            int? totalTokens = intField(usage, "total_tokens");
-            if inputTokens is int {
-                mapped.promptTokens = inputTokens;
+            StreamUsage? mapped = streamUsage(intField(usage, "input_tokens"), intField(usage, "output_tokens"));
+            if mapped is StreamUsage {
+                update.usage = mapped;
             }
-            if outputTokens is int {
-                mapped.completionTokens = outputTokens;
-            }
-            // Responses reports a total; derive it only when it did not, so the
-            // caller sees the service's own number wherever there is one.
-            if totalTokens is int {
-                mapped.totalTokens = totalTokens;
-            } else if inputTokens is int && outputTokens is int {
-                mapped.totalTokens = inputTokens + outputTokens;
-            }
-            chunk.usage = mapped;
         }
-        return chunk;
+        return update;
     }
 
     // `response.failed` / `error`. Surfaced as an error rather than skipped: the

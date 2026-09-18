@@ -17,9 +17,9 @@ import ballerina/ai.observe;
 import ballerina/http;
 import ballerina/io;
 
-// The streaming spine — `chatStream` for every vendor facade, plus the
-// `generateStream` text projection. Mirrors `runChat` in provider_common.bal: the
-// facades stay thin, and all the logic lives here.
+// The streaming spine — `chatAsStream` and `generateAsStream` for every vendor
+// facade. Mirrors `runChat` in provider_common.bal: the facades stay thin, and all
+// the logic lives here.
 
 // How many bytes to pull per read from the response body.
 //
@@ -62,36 +62,17 @@ import ballerina/io;
 // own parser, which sizes its own reads.
 const int STREAM_READ_SIZE = 16;
 
-// The whole `chatStream()` implementation, shared by every vendor facade.
+// The whole `chatAsStream()` implementation, shared by every vendor facade.
 //
 // NOT `isolated`, unlike `runChat`. The returned stream is backed by an iterator
 // holding mutable framing state (a partially-filled byte buffer, the tool-index
 // map) that necessarily outlives this call. `ai:ModelProvider` does not declare
-// `chatStream` isolated either, so the facades match the contract.
+// `chatAsStream` isolated either, so the facades match the contract.
 function runChatStream(string providerName, ApiFamily family, string wireModelId,
         readonly & ModelConverter converter, BedrockTransport transport, map<string> & readonly extraHeaders,
         readonly & InferenceParams params, ai:ChatMessage[]|ai:ChatUserMessage messages,
         ai:ChatCompletionFunctions[] tools, string? stop)
-        returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
-    // Refused BEFORE any I/O, naming the escape hatch — the same shape as the
-    // module's other capability guards. The converter carries its own dialect, so the
-    // capability check and the dialect it implies are one lookup and cannot
-    // disagree — including on an opaque ARN, whose converter `selectConverter` resolves
-    // from `modelSchema` rather than from the (ARN-valued) model id.
-    //
-    // Every converter the module ships now carries a dialect, so this is unreachable
-    // today. It stays because the field is what makes streaming support a property
-    // of the converter: a dialect AWS ships next that this module can encode but not
-    // decode incrementally gets a clean refusal here rather than a silent empty
-    // stream.
-    StreamDialect? dialect = converter.streamDialect;
-    if dialect is () {
-        return error ai:Error(string `Streaming is not supported for model '${wireModelId}' on the ` +
-            string `${family} route. Use 'apiFamily = CONVERSE' — ConverseStream is model-agnostic ` +
-            string `and streams every vendor.`);
-    }
-    StreamWire wire = streamWireFor(family);
-
+        returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error {
     ai:ChatMessage[] msgs;
     if messages is ai:ChatUserMessage {
         msgs = [messages];
@@ -126,6 +107,69 @@ function runChatStream(string providerName, ApiFamily family, string wireModelId
     // Recorded from the RESOLVED form so an image becomes a placeholder rather than
     // shipping megabytes of user data to the telemetry backend.
     span.addInputMessages(messagesForSpan(system, rest));
+    return openChunkStream(family, wireModelId, converter, transport, extraHeaders, params,
+            system, rest, tools, stop, span);
+}
+
+// The whole `generateAsStream()` implementation, shared by every vendor facade.
+//
+// The request is built exactly as `generate()` builds it for a text answer (see
+// `plainTextResponse`): the prompt resolved to parts as a single user message, no
+// system prompt, no tools, on the provider's generate spine. Only the answer text
+// reaches the caller — reasoning, tool-call and finish-only chunks are dropped.
+//
+// Streaming yields text only: a structured value has no valid intermediate state,
+// so typed output stays with `generate()`.
+function runGenerateStream(string providerName, ApiFamily family, string wireModelId,
+        readonly & ModelConverter converter, BedrockTransport transport, map<string> & readonly extraHeaders,
+        readonly & InferenceParams params, ai:Prompt prompt) returns stream<string, ai:Error?>|ai:Error {
+    observe:GenerateContentSpan span = observe:createGenerateContentSpan(wireModelId);
+    span.addProvider(providerName);
+    decimal? spanTemperature = params?.temperature;
+    if spanTemperature is decimal {
+        span.addTemperature(spanTemperature);
+    }
+    ContentPart[]|ai:Error parts = contentToParts(prompt);
+    if parts is ai:Error {
+        span.close(parts);
+        return parts;
+    }
+    ResolvedUserMessage userMsg = {parts};
+    ResolvedMessage[] resolved = [userMsg];
+    span.addInputMessages(messagesForSpan((), resolved));
+    stream<ai:ChatMessageChunk, ai:Error?> chunks = check openChunkStream(family, wireModelId, converter,
+            transport, extraHeaders, params, (), resolved, [], (), span);
+    stream<string, ai:Error?> text = new (new ChunkTextIterator(chunks));
+    return text;
+}
+
+// Encodes the resolved request, opens the live response and wraps it in a chunk
+// stream that owns `span` from here on. Closes `span` itself on every failure
+// before the stream exists.
+function openChunkStream(ApiFamily family, string wireModelId, readonly & ModelConverter converter,
+        BedrockTransport transport, map<string> & readonly extraHeaders, readonly & InferenceParams params,
+        string? system, ResolvedMessage[] rest, ai:ChatCompletionFunctions[] tools, string? stop,
+        StreamSpan span) returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error {
+    // Refused BEFORE any I/O, naming the escape hatch — the same shape as the
+    // module's other capability guards. The converter carries its own dialect, so the
+    // capability check and the dialect it implies are one lookup and cannot
+    // disagree — including on an opaque ARN, whose converter `selectConverter` resolves
+    // from `modelSchema` rather than from the (ARN-valued) model id.
+    //
+    // Every converter the module ships now carries a dialect, so this is unreachable
+    // today. It stays because the field is what makes streaming support a property
+    // of the converter: a dialect AWS ships next that this module can encode but not
+    // decode incrementally gets a clean refusal here rather than a silent empty
+    // stream.
+    StreamDialect? dialect = converter.streamDialect;
+    if dialect is () {
+        ai:Error err = error ai:Error(string `Streaming is not supported for model '${wireModelId}' on the ` +
+            string `${family} route. Use 'apiFamily = CONVERSE' — ConverseStream is model-agnostic ` +
+            string `and streams every vendor.`);
+        span.close(err);
+        return err;
+    }
+    StreamWire wire = streamWireFor(family);
 
     // The encoder is reused verbatim — a streaming request differs from a buffered
     // one only in how the route ASKS for the stream, never in what it asks for. On
@@ -161,15 +205,15 @@ function runChatStream(string providerName, ApiFamily family, string wireModelId
         return events;
     }
 
-    string? responseId = responseHeaders[REQUEST_ID_HEADER];
-    if responseId is string {
-        span.addResponseId(responseId);
+    string? requestId = responseHeaders[REQUEST_ID_HEADER];
+    if requestId is string {
+        span.addResponseId(requestId);
     }
     // Assigned to an explicitly typed local before returning: `new (iterator)`
     // cannot infer the stream's type parameters when the function returns a UNION
     // (`stream<...>|ai:Error`).
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
-            events, newStreamDecoder(dialect), responseId, wireModelId, span));
+    stream<ai:ChatMessageChunk, ai:Error?> chunks = new (new BedrockChunkIterator(
+            events, newStreamDecoder(dialect), requestId, span));
     return chunks;
 }
 
@@ -228,40 +272,44 @@ isolated function openEventSource(http:Response response, StreamWire wire, boole
     return new EventStreamEventSource(bytes, unwrapBytes);
 }
 
-# Turns a source of native events into normalized chunks.
+# Turns a source of native events into `ai:ChatMessageChunk`s.
 #
 # Wire-format agnostic by construction: framing, the Invoke envelope, in-band
 # service exceptions and truncation all live behind `StreamEventSource`, and the
 # dialect's event model lives behind `StreamChunkDecoder`. What is left here is what
-# is TRUE OF EVERY BEDROCK STREAM — identity backfill, span accounting, latching a
-# failure, and releasing the response.
+# is TRUE OF EVERY BEDROCK STREAM — stamping the response id, span accounting,
+# latching a failure, and releasing the response.
 #
 # Owns the observe span for the whole response, because a stream outlives the call
-# that created it — `runChatStream` has already returned by the time the first chunk
-# is pulled, so it cannot close the span itself.
+# that created it — `openChunkStream` has already returned by the time the first
+# chunk is pulled, so it cannot close the span itself.
 class BedrockChunkIterator {
     private final StreamEventSource events;
     private final StreamChunkDecoder decoder;
-    private final string? responseId;
-    private final string wireModelId;
-    private final observe:ChatSpan span;
+    private final string? requestId;
+    private final StreamSpan span;
+    // The provider's own response id, once an event has named it.
+    private string? responseId = ();
+    // The id stamped on every chunk, fixed when the first chunk goes out so it stays
+    // stable across the whole response.
+    private string? chunkId = ();
     // Accumulated for the span, which wants the totals a non-streaming call reads
-    // straight off the response body.
-    private int promptTokens = 0;
-    private int completionTokens = 0;
-    private string finishReason = "";
+    // straight off the response body. Module-visible so tests can read them; the
+    // span itself cannot be observed from outside `ai.observe`.
+    int inputTokens = 0;
+    int outputTokens = 0;
+    string finishReason = "";
     private boolean closed = false;
 
-    isolated function init(StreamEventSource events, StreamChunkDecoder decoder,
-            string? responseId, string wireModelId, observe:ChatSpan span) {
+    isolated function init(StreamEventSource events, StreamChunkDecoder decoder, string? requestId,
+            StreamSpan span) {
         self.events = events;
         self.decoder = decoder;
-        self.responseId = responseId;
-        self.wireModelId = wireModelId;
+        self.requestId = requestId;
         self.span = span;
     }
 
-    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+    public isolated function next() returns record {|ai:ChatMessageChunk value;|}|ai:Error? {
         // Once the stream has ended — cleanly, on an error, or because the caller
         // closed it — it stays ended. Without this, a consumer that keeps pulling
         // after a reported failure re-enters the read loop and can be handed MORE
@@ -279,49 +327,50 @@ class BedrockChunkIterator {
                 self.finish();
                 return ();
             }
-            ai:ChatCompletionChunk|ai:Error? chunk = self.decoder.decode(event.eventType, event.payload);
-            if chunk is ai:Error {
-                return self.failWith(chunk);
+            StreamUpdate|ai:Error? update = self.decoder.decode(event.eventType, event.payload);
+            if update is ai:Error {
+                return self.failWith(update);
             }
-            if chunk is () {
-                // An event with nothing to surface (contentBlockStop, ping, an event
-                // type the vendor added later). Pull the next one rather than
-                // emitting an empty chunk a caller would have to filter out.
+            if update is () {
                 continue;
             }
-            ai:ChatCompletionChunk out = self.withIdentity(chunk);
-            self.recordForSpan(out);
-            return {value: out};
+            self.accumulate(update);
+            ai:ChatMessageChunk? chunk = update?.chunk;
+            if chunk is () {
+                // Pings, message-start markers, usage-only closers: nothing for the
+                // caller, so pull the next event rather than emit an empty chunk.
+                continue;
+            }
+            return {value: self.withId(chunk)};
         }
     }
 
-    // Fills in the identity the dialect did not supply. Converse events carry
-    // neither id nor model: the request id from the response header is the only
-    // value stable across every chunk of a response, which is what the contract
-    // asks `id` to be. The OpenAI-shaped dialects carry both and keep them.
-    private isolated function withIdentity(ai:ChatCompletionChunk chunk) returns ai:ChatCompletionChunk {
-        ai:ChatCompletionChunk out = chunk;
-        if out.id is () {
-            string? id = self.responseId;
-            if id is string {
-                out.id = id;
-            }
+    // Stamps the response id. The provider's own id wins; Converse events carry
+    // none, and there the request id from the response header is the only value
+    // stable across every chunk of a response.
+    private isolated function withId(ai:ChatMessageChunk chunk) returns ai:ChatMessageChunk {
+        string? id = self.chunkId ?: self.responseId ?: self.requestId;
+        self.chunkId = id;
+        if id is string {
+            chunk.id = id;
         }
-        if out.model is () {
-            out.model = self.wireModelId;
-        }
-        return out;
+        return chunk;
     }
 
     // Accumulates what the span reports at close.
-    private isolated function recordForSpan(ai:ChatCompletionChunk chunk) {
-        ai:CompletionTokenUsage? usage = chunk?.usage;
-        if usage is ai:CompletionTokenUsage {
-            self.promptTokens = usage?.promptTokens ?: self.promptTokens;
-            self.completionTokens = usage?.completionTokens ?: self.completionTokens;
+    private isolated function accumulate(StreamUpdate update) {
+        string? responseId = update?.responseId;
+        if responseId is string && self.responseId is () {
+            self.responseId = responseId;
         }
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            ai:FinishReason? reason = choice.finishReason;
+        StreamUsage? usage = update?.usage;
+        if usage is StreamUsage {
+            self.inputTokens = usage?.inputTokens ?: self.inputTokens;
+            self.outputTokens = usage?.outputTokens ?: self.outputTokens;
+        }
+        ai:ChatMessageChunk? chunk = update?.chunk;
+        if chunk is ai:ChatMessageChunk {
+            ai:FinishReason? reason = chunk.finishReason;
             if reason is ai:FinishReason {
                 self.finishReason = reason;
             }
@@ -334,15 +383,14 @@ class BedrockChunkIterator {
             return;
         }
         self.closed = true;
-        self.span.addInputTokenCount(self.promptTokens);
-        self.span.addOutputTokenCount(self.completionTokens);
+        self.span.addInputTokenCount(self.inputTokens);
+        self.span.addOutputTokenCount(self.outputTokens);
         if self.finishReason != "" {
             self.span.addFinishReason(self.finishReason);
             // Paired with the finish reason, as in the reference iterator. `TEXT` is
             // the only honest value: `observe:OutputType` is TEXT|JSON, and a chat
             // stream is text deltas even when some of them carry tool-call
-            // fragments — structured output never streams (see
-            // `generateLlmResponseStream`).
+            // fragments — structured output never streams.
             self.span.addOutputType(observe:TEXT);
         }
         self.span.close();
@@ -374,71 +422,31 @@ class BedrockChunkIterator {
     }
 }
 
-// Builds the string stream behind the dependently-typed `generateStream`.
-//
-// Invoked by the `StreamGenerator` native shim. Regular (non-dependent) function:
-// the Java boundary coerces the result to the caller's `td`.
-//
-// NOT `isolated` — it calls the non-isolated `chatStream`.
-//
-// + llmModel - The provider whose `chatStream` supplies the chunks
-// + prompt - The prompt to run
-// + td - The caller's expected type; only `string` is supported
-// + return - A stream of text fragments, or an `ai:Error`
-function generateLlmResponseStream(ai:ModelProvider llmModel, ai:Prompt prompt, typedesc<anydata> td)
-        returns stream<string, ai:Error?>|ai:Error {
-    // Structured output cannot stream: `generate()` gets its typed value out of a
-    // FORCED TOOL CALL, whose arguments are only bindable once the whole JSON has
-    // arrived — there is no partial record to hand back. A typed target is a clean
-    // error rather than a stream that yields nothing until the end.
-    if td !is typedesc<string> {
-        return error ai:LlmInvalidGenerationError(
-            "'generateStream' supports only 'string'; use 'generate' for structured types.");
-    }
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check llmModel->chatStream({role: ai:USER, content: prompt});
-    stream<string, ai:Error?> text = new (new ChunkTextIterator(chunks));
-    return text;
-}
-
-# Projects a chunk stream onto its text fragments, skipping the chunks that carry
-# no content — role-only openers, reasoning, tool-call fragments, usage-only closers.
+# Projects a chunk stream onto its answer text, yielding each non-empty `content`
+# fragment and skipping reasoning, tool-call and finish-only chunks.
 class ChunkTextIterator {
-    private final stream<ai:ChatCompletionChunk, ai:Error?> chunks;
+    private final stream<ai:ChatMessageChunk, ai:Error?> chunks;
 
-    isolated function init(stream<ai:ChatCompletionChunk, ai:Error?> chunks) {
+    isolated function init(stream<ai:ChatMessageChunk, ai:Error?> chunks) {
         self.chunks = chunks;
     }
 
     public isolated function next() returns record {|string value;|}|ai:Error? {
         while true {
-            record {|ai:ChatCompletionChunk value;|}|ai:Error? next = self.chunks.next();
-            if next is ai:Error {
+            record {|ai:ChatMessageChunk value;|}|ai:Error? next = self.chunks.next();
+            if next !is record {|ai:ChatMessageChunk value;|} {
                 return next;
             }
-            if next is () {
-                return ();
-            }
-            string text = "";
-            foreach ai:ChatCompletionChunkChoice choice in next.value.choices {
-                string? content = choice.delta.content;
-                if content is string {
-                    text += content;
-                }
-            }
-            // An empty fragment is not end-of-stream; keep pulling. Emitting "" for
-            // every tool-call fragment would flood a caller printing the stream.
-            if text != "" {
-                return {value: text};
+            string? content = next.value.content;
+            if content is string && content != "" {
+                return {value: content};
             }
         }
     }
 
-    // Propagates the close to the chunk stream underneath.
-    //
-    // Without this, closing the `generateStream` text stream releases nothing: the
-    // wrapped chunk stream — and through it the live HTTP response — stays open, so
-    // the `BedrockChunkIterator` release would be unreachable from a `generateStream`
-    // caller.
+    // Propagates the close to the chunk stream underneath — and through it to the
+    // live HTTP response and the span. Without this, closing a `generateAsStream`
+    // text stream early would release nothing.
     public isolated function close() returns ai:Error? {
         return self.chunks.close();
     }

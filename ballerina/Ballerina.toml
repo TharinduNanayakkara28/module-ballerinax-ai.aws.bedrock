@@ -11,11 +11,11 @@ license = ["Apache-2.0"]
 [build-options]
 observabilityIncluded = true
 
-# TEMPORARY — streaming contract. `ai` 1.13.0 on Ballerina Central does NOT declare
-# `chatStream`/`generateStream`; the copy carrying them is the local build of
-# module-ballerina-ai branch `feat/add-chat-stream-support`, pushed with
-# `bal push --repository=local`. Same coordinates, different content, so a machine
-# without that local push resolves Central's and fails to compile.
+# TEMPORARY — streaming contract. No `ai` release on Ballerina Central (up to 1.15.0)
+# declares `chatAsStream`/`generateAsStream`/`ChatMessageChunk`; the copy carrying them
+# is a local build of module-ballerina-ai, pushed with `bal push --repository=local`.
+# Same coordinates, different content, so a machine without that local push resolves
+# Central's and fails to compile.
 # MUST be swapped for a published `ai` release before this branch merges.
 [[dependency]]
 org = "ballerina"

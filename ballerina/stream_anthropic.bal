@@ -14,8 +14,8 @@
 
 import ballerina/ai;
 
-// Anthropic streaming events on `InvokeModelWithResponseStream` ->
-// `ai:ChatCompletionChunk`.
+// Anthropic streaming events on `InvokeModelWithResponseStream` and Mantle Messages
+// -> `ai:ChatMessageChunk`.
 //
 // The one dialect that is NOT Converse-shaped. Every frame arrives with
 // `:event-type: chunk`, so the event is named by the payload's own `type` field
@@ -39,11 +39,8 @@ class AnthropicStreamDecoder {
     *StreamChunkDecoder;
 
     private final ToolIndexMap toolIndex = new;
-    // The prompt-token count, carried from `message_start` to `message_delta` so the
-    // two halves of `usage` reach the caller together. See `decodeMessageStart`.
-    private int promptTokens = 0;
 
-    isolated function decode(string eventType, json payload) returns ai:ChatCompletionChunk|ai:Error? {
+    isolated function decode(string eventType, json payload) returns StreamUpdate|ai:Error? {
         map<json> p = payload is map<json> ? payload : {};
         // The frame header is the constant `chunk` here; the dialect names its own
         // events in the body.
@@ -80,59 +77,44 @@ class AnthropicStreamDecoder {
         return ();
     }
 
-    // `message_start` carries the response id, the resolved model, and the input
-    // token count. Anthropic reports prompt tokens HERE and completion tokens on
-    // `message_delta` — the two halves of `usage` arrive in different events, unlike
-    // Converse which sends both together in `metadata`.
-    //
-    // The prompt count is STASHED rather than emitted on this chunk. `ai` documents
-    // `usage` as "present only on the final chunk", so a caller reading usage off the
-    // last chunk — the natural reading, and what the non-streaming path returns —
-    // would otherwise see `completionTokens` alone and silently lose the prompt half.
-    // `message_delta` re-joins them.
-    private isolated function decodeMessageStart(map<json> p) returns ai:ChatCompletionChunk? {
+    // `message_start` carries the message id and the INPUT token count — Anthropic
+    // reports the output count separately, on `message_delta`. Nothing here is for
+    // the caller, so it yields no chunk; the id is stamped on every later chunk.
+    private isolated function decodeMessageStart(map<json> p) returns StreamUpdate? {
         map<json>? message = mapField(p, "message");
-        ai:ChatCompletionChunk chunk = singleChoiceChunk({role: ai:ASSISTANT});
         if message is () {
-            return chunk;
+            return ();
         }
+        StreamUpdate update = {};
         string? id = strField(message, "id");
         if id is string {
-            chunk.id = id;
-        }
-        string? model = strField(message, "model");
-        if model is string {
-            chunk.model = model;
+            update.responseId = id;
         }
         map<json>? usage = mapField(message, "usage");
         if usage is map<json> {
-            int? inputTokens = intField(usage, "input_tokens");
-            if inputTokens is int {
-                self.promptTokens = inputTokens;
+            StreamUsage? mapped = streamUsage(intField(usage, "input_tokens"), ());
+            if mapped is StreamUsage {
+                update.usage = mapped;
             }
         }
-        return chunk;
+        return update;
     }
 
     // `content_block_start` opens a block. Only a `tool_use` block carries anything
     // the contract wants — the tool's id and name, which arrive nowhere else.
-    private isolated function decodeBlockStart(map<json> p) returns ai:ChatCompletionChunk? {
+    private isolated function decodeBlockStart(map<json> p) returns StreamUpdate? {
         map<json>? block = mapField(p, "content_block");
         if block is () || strField(block, "type") != "tool_use" {
             return ();
         }
         int blockIndex = intField(p, "index") ?: 0;
-        ai:ToolCallChunk chunk = {
-            index: self.toolIndex.indexFor(blockIndex),
-            id: strField(block, "id"),
-            'function: {name: strField(block, "name")}
-        };
-        return singleChoiceChunk({toolCalls: [chunk]});
+        return toolCallUpdate(toolCallChunk(self.toolIndex.indexFor(blockIndex),
+                id = strField(block, "id"), name = strField(block, "name")));
     }
 
     // `content_block_delta` carries every incremental fragment, tagged by
     // `delta.type`.
-    private isolated function decodeBlockDelta(map<json> p) returns ai:ChatCompletionChunk? {
+    private isolated function decodeBlockDelta(map<json> p) returns StreamUpdate? {
         map<json>? delta = mapField(p, "delta");
         if delta is () {
             return ();
@@ -141,69 +123,45 @@ class AnthropicStreamDecoder {
 
         match strField(delta, "type") {
             "text_delta" => {
-                string? text = strField(delta, "text");
-                return text is string ? singleChoiceChunk({content: text}) : ();
+                return contentUpdate(strField(delta, "text"));
             }
             "input_json_delta" => {
-                // Tool arguments as partial JSON. Forwarded on EVERY fragment,
-                // keyed by the index the opening `content_block_start` used — only
-                // the first fragment carries id and name, only the rest carry
-                // arguments, and a caller needs both halves to reconstruct the call.
+                // Tool arguments as partial JSON, forwarded raw under the index the
+                // opening `content_block_start` used. The first delta is often "".
                 string? partial = strField(delta, "partial_json");
-                if partial is () {
+                if partial is () || partial == "" {
                     return ();
                 }
-                ai:ToolCallChunk chunk = {
-                    index: self.toolIndex.indexFor(blockIndex),
-                    'function: {arguments: partial}
-                };
-                return singleChoiceChunk({toolCalls: [chunk]});
+                return toolCallUpdate(toolCallChunk(self.toolIndex.indexFor(blockIndex), arguments = partial));
             }
             "thinking_delta" => {
-                string? thinking = strField(delta, "thinking");
-                return thinking is string ? singleChoiceChunk({reasoning: thinking}) : ();
-            }
-            "signature_delta" => {
-                // The encrypted replay token for a thinking block — not readable
-                // text, and the contract has nowhere to carry it. Skipped rather
-                // than mixed into `reasoning`.
-                return ();
+                return reasoningUpdate(strField(delta, "thinking"));
             }
         }
+        // `signature_delta` is the encrypted replay token for a thinking block — not
+        // readable text, so it is skipped rather than mixed into `reasoning`.
         return ();
     }
 
     // `message_delta` closes the response: the stop reason plus the OUTPUT token
-    // count. It is the LAST chunk this decoder emits — `message_stop` and the final
-    // `ping` carry nothing the contract can express — so it is where the complete
-    // `usage` belongs, rejoined with the prompt count stashed on `message_start`.
-    //
-    // `totalTokens` is derived rather than read: Anthropic reports the two halves and
-    // no total, while Converse sends all three. Computing it here means a caller sees
-    // the same fully-populated `usage` on either dialect.
-    private isolated function decodeMessageDelta(map<json> p) returns ai:ChatCompletionChunk? {
+    // count (and, on newer API versions, a restated input count).
+    private isolated function decodeMessageDelta(map<json> p) returns StreamUpdate? {
+        StreamUpdate update = {};
         map<json>? delta = mapField(p, "delta");
         ai:FinishReason? finishReason = delta is map<json>
             ? mapAnthropicFinishReason(strField(delta, "stop_reason"))
             : ();
-        ai:ChatCompletionChunk chunk = singleChoiceChunk({}, finishReason);
-        int? outputTokens = ();
+        if finishReason is ai:FinishReason {
+            update.chunk = {role: ai:ASSISTANT, finishReason};
+        }
         map<json>? usage = mapField(p, "usage");
         if usage is map<json> {
-            outputTokens = intField(usage, "output_tokens");
+            StreamUsage? mapped = streamUsage(intField(usage, "input_tokens"), intField(usage, "output_tokens"));
+            if mapped is StreamUsage {
+                update.usage = mapped;
+            }
         }
-        if outputTokens is int {
-            chunk.usage = {
-                promptTokens: self.promptTokens,
-                completionTokens: outputTokens,
-                totalTokens: self.promptTokens + outputTokens
-            };
-        } else if self.promptTokens > 0 {
-            // A `message_delta` with no output count still has to carry the prompt
-            // half; dropping it would lose the only usage the response reported.
-            chunk.usage = {promptTokens: self.promptTokens};
-        }
-        return chunk;
+        return update;
     }
 }
 

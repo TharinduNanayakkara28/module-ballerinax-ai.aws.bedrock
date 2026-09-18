@@ -320,7 +320,7 @@ isolated client class BedrockTransport {
                 // one sends the reader to the wrong policy. Streaming is its OWN IAM
                 // action on both runtime operations — `ConverseStream` included,
                 // despite being authorized separately from `Converse` — so a role
-                // that calls `chat` fine can still be denied `chatStream`.
+                // that calls `chat` fine can still be denied `chatAsStream`.
                 string hint;
                 if mantle {
                     // Covers streaming and non-streaming alike on this endpoint,
@@ -329,7 +329,7 @@ isolated client class BedrockTransport {
                         "'bedrock:InvokeModel' permissions are NOT sufficient.";
                 } else if streaming {
                     hint = " Streaming needs the separate 'bedrock:InvokeModelWithResponseStream' IAM " +
-                        "action — 'bedrock:InvokeModel' alone covers 'chat' but NOT 'chatStream'.";
+                        "action — 'bedrock:InvokeModel' alone covers 'chat' but NOT 'chatAsStream'.";
                 } else if agent {
                     hint = " Knowledge base ingestion needs BOTH 'bedrock:StartIngestionJob' and " +
                         "'bedrock:IngestKnowledgeBaseDocuments' — either alone is insufficient.";

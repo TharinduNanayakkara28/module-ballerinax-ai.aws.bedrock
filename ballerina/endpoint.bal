@@ -198,7 +198,7 @@ isolated function buildEndpoint(Route route, string serviceUrl = DEFAULT_SERVICE
             // Mantle streams as SSE on the SAME path, switched on by a `"stream":
             // true` body field (carried by the converter's `streamFields`) rather than
             // by a different endpoint — so the stream path IS the path. The two
-            // members are kept distinct anyway: `runChatStream` posts to
+            // members are kept distinct anyway: `openChunkStream` posts to
             // `streamPath` on every route, and collapsing them here is what keeps
             // that one call site free of a Mantle special case.
             // https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html

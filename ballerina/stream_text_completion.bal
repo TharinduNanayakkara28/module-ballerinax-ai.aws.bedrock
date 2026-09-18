@@ -14,7 +14,7 @@
 
 import ballerina/ai;
 
-// The two Invoke TEXT-COMPLETION dialects -> `ai:ChatCompletionChunk`.
+// The two Invoke TEXT-COMPLETION dialects -> `ai:ChatMessageChunk`.
 //
 //   Mistral text  {"outputs": [{"text": string, "stop_reason": string}]}
 //   DeepSeek R1   {"choices": [{"text": string, "stop_reason": string}]}
@@ -42,14 +42,8 @@ import ballerina/ai;
 class TextCompletionStreamDecoder {
     *StreamChunkDecoder;
 
-    isolated function decode(string eventType, json payload) returns ai:ChatCompletionChunk|ai:Error? {
+    isolated function decode(string eventType, json payload) returns StreamUpdate|ai:Error? {
         map<json> p = payload is map<json> ? payload : {};
-
-        // Bedrock staples the token counts onto the last frame. It is the ONLY
-        // usage either dialect ever reports — their buffered bodies carry no
-        // `usage` object at all — so it is read before anything else, since that
-        // frame can arrive alongside the final text or on its own.
-        ai:CompletionTokenUsage? usage = invocationMetricsUsage(p);
 
         json[]? items = arrField(p, "outputs") ?: arrField(p, "choices");
         string? text = ();
@@ -62,17 +56,22 @@ class TextCompletionStreamDecoder {
             }
         }
 
-        if text is () && finishReason is () {
-            return usage is ai:CompletionTokenUsage ? usageChunk(usage) : ();
+        StreamUpdate update = {};
+        ai:ChatMessageChunk chunk = {role: ai:ASSISTANT, finishReason};
+        if text is string && text != "" {
+            chunk.content = text;
         }
-        ai:ChatCompletionChunkDelta delta = {};
-        if text is string {
-            delta.content = text;
+        if chunk.content is string || finishReason is ai:FinishReason {
+            update.chunk = chunk;
         }
-        ai:ChatCompletionChunk chunk = singleChoiceChunk(delta, finishReason);
-        if usage is ai:CompletionTokenUsage {
-            chunk.usage = usage;
+        // Bedrock staples the token counts onto the last frame. It is the ONLY
+        // usage either dialect ever reports — their buffered bodies carry no
+        // `usage` object at all — and that frame can arrive alongside the final
+        // text or on its own.
+        StreamUsage? usage = invocationMetricsUsage(p);
+        if usage is StreamUsage {
+            update.usage = usage;
         }
-        return chunk;
+        return update.length() == 0 ? () : update;
     }
 }

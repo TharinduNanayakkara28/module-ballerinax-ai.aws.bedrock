@@ -14,21 +14,38 @@
 
 import ballerina/ai;
 import ballerina/test;
+// Native stream event -> `StreamUpdate` (an `ai:ChatMessageChunk` for the caller,
+// token usage for the span, the provider's response id). Pure mapping, driven with
+// the exact event shapes each dialect puts on the wire.
 
-// Native stream event -> normalized `ai:ChatCompletionChunk`. Pure mapping, driven
-// with the exact event shapes the two dialects put on the wire.
+// Decodes one event, asserting it produced an update.
+function decodeUpdate(StreamChunkDecoder decoder, string eventType, json payload) returns StreamUpdate {
+    StreamUpdate|ai:Error? update = decoder.decode(eventType, payload);
+    if update !is StreamUpdate {
+        panic error("expected an update for event " + eventType);
+    }
+    return update;
+}
 
-// Decodes one event, asserting it produced a chunk.
-function decodeOne(StreamChunkDecoder decoder, string eventType, json payload) returns ai:ChatCompletionChunk {
-    ai:ChatCompletionChunk|ai:Error? chunk = decoder.decode(eventType, payload);
-    if chunk !is ai:ChatCompletionChunk {
+// Decodes one event, asserting it produced a chunk for the caller.
+function decodeOne(StreamChunkDecoder decoder, string eventType, json payload) returns ai:ChatMessageChunk {
+    ai:ChatMessageChunk? chunk = decodeUpdate(decoder, eventType, payload)?.chunk;
+    if chunk is () {
         panic error("expected a chunk for event " + eventType);
     }
     return chunk;
 }
 
-// The single delta every Bedrock chunk carries.
-function deltaOf(ai:ChatCompletionChunk chunk) returns ai:ChatCompletionChunkDelta => chunk.choices[0].delta;
+// Whether an event produced nothing for the caller.
+function yieldsNoChunk(StreamUpdate|ai:Error? update) returns boolean =>
+    update is () || (update is StreamUpdate && update?.chunk is ());
+
+// The single tool-call fragment a chunk carries.
+function toolCallOf(ai:ChatMessageChunk chunk) returns ai:ToolCallChunk {
+    ai:ToolCallChunk[] calls = <ai:ToolCallChunk[]>chunk.toolCalls;
+    test:assertEquals(calls.length(), 1);
+    return calls[0];
+}
 
 // ---------------------------------------------------------------------------
 // Converse
@@ -37,19 +54,22 @@ function deltaOf(ai:ChatCompletionChunk chunk) returns ai:ChatCompletionChunkDel
 @test:Config {}
 function testConverseStreamMapsTextDeltaToContent() {
     ConverseStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
+    ai:ChatMessageChunk chunk = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
             {"contentBlockIndex": 0, "delta": {"text": "Hello"}});
-    test:assertEquals(deltaOf(chunk).content, "Hello");
-    test:assertEquals(chunk.choices[0].index, 0);
-    test:assertEquals(chunk.choices[0].finishReason, ());
+    test:assertEquals(chunk.role, ai:ASSISTANT);
+    test:assertEquals(chunk.content, "Hello");
+    test:assertEquals(chunk.reasoning, ());
+    test:assertEquals(chunk.toolCalls, ());
+    test:assertEquals(chunk.finishReason, ());
 }
 
 @test:Config {}
-function testConverseStreamMapsRoleOnlyOnMessageStart() {
+function testConverseStreamSkipsMessageStartAndEmptyText() {
+    // `messageStart` only restates the role, which every chunk now carries anyway.
     ConverseStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, CONVERSE_EVT_MESSAGE_START, {"role": "assistant"});
-    test:assertEquals(deltaOf(chunk).role, ai:ASSISTANT);
-    test:assertEquals(deltaOf(chunk).content, ());
+    test:assertTrue(yieldsNoChunk(decoder.decode(CONVERSE_EVT_MESSAGE_START, {"role": "assistant"})));
+    test:assertTrue(yieldsNoChunk(decoder.decode(CONVERSE_EVT_CONTENT_BLOCK_DELTA,
+            {"contentBlockIndex": 0, "delta": {"text": ""}})), "an empty text delta carries nothing");
 }
 
 @test:Config {}
@@ -57,42 +77,44 @@ function testConverseStreamMapsReasoningContentToReasoning() {
     // Bedrock streams Claude/Nova thinking as READABLE text, so `reasoning` is
     // genuinely populated here — unlike providers whose thought traces are opaque.
     ConverseStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
+    ai:ChatMessageChunk chunk = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
             {"contentBlockIndex": 0, "delta": {"reasoningContent": {"text": "let me think"}}});
-    test:assertEquals(deltaOf(chunk).reasoning, "let me think");
-    test:assertEquals(deltaOf(chunk).content, (), "reasoning must not leak into the answer text");
+    test:assertEquals(chunk.reasoning, "let me think");
+    test:assertEquals(chunk.content, (), "reasoning must not leak into the answer text");
 }
 
 @test:Config {}
 function testConverseStreamSkipsOpaqueReasoningSignature() {
     // The encrypted replay token is not readable text and has nowhere to go.
     ConverseStreamDecoder decoder = new;
-    ai:ChatCompletionChunk|ai:Error? chunk = decoder.decode(CONVERSE_EVT_CONTENT_BLOCK_DELTA,
-            {"contentBlockIndex": 0, "delta": {"reasoningContent": {"signature": "AbC123=="}}});
-    test:assertTrue(chunk is (), "an opaque signature delta must be skipped, not emitted as reasoning");
+    test:assertTrue(yieldsNoChunk(decoder.decode(CONVERSE_EVT_CONTENT_BLOCK_DELTA,
+            {"contentBlockIndex": 0, "delta": {"reasoningContent": {"signature": "AbC123=="}}})),
+            "an opaque signature delta must be skipped, not emitted as reasoning");
 }
 
 @test:Config {}
 function testConverseStreamStreamsToolCallArgumentFragments() {
-    // The whole point of forwarding EVERY fragment: id and name arrive only on the
-    // opening event, arguments only on the deltas. Keeping just the first would
-    // yield a named tool call with no arguments.
+    // id and name arrive only on the opening event, arguments only on the deltas —
+    // forwarded raw, never accumulated or parsed inside the provider.
     ConverseStreamDecoder decoder = new;
 
-    ai:ChatCompletionChunk opened = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_START,
-            {"contentBlockIndex": 0, "start": {"toolUse": {"toolUseId": "tu_1", "name": "get_weather"}}});
-    ai:ToolCallChunk[] openCalls = <ai:ToolCallChunk[]>deltaOf(opened).toolCalls;
-    test:assertEquals(openCalls[0].id, "tu_1");
-    test:assertEquals(openCalls[0]?.'function?.name, "get_weather");
+    ai:ToolCallChunk opened = toolCallOf(decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_START,
+            {"contentBlockIndex": 0, "start": {"toolUse": {"toolUseId": "tu_1", "name": "get_weather"}}}));
+    test:assertEquals(opened.index, 0);
+    test:assertEquals(opened?.id, "tu_1");
+    test:assertEquals(opened?.name, "get_weather");
+    test:assertEquals(opened?.arguments, (), "the opening fragment carries no arguments");
 
     string[] fragments = ["{\"cit", "y\":\"Par", "is\"}"];
     string reassembled = "";
     foreach string fragment in fragments {
-        ai:ChatCompletionChunk chunk = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
-                {"contentBlockIndex": 0, "delta": {"toolUse": {"input": fragment}}});
-        ai:ToolCallChunk[] calls = <ai:ToolCallChunk[]>deltaOf(chunk).toolCalls;
-        test:assertEquals(calls[0].index, 0, "every fragment must carry the same accumulation index");
-        reassembled += calls[0]?.'function?.arguments ?: "";
+        ai:ToolCallChunk call = toolCallOf(decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
+                {"contentBlockIndex": 0, "delta": {"toolUse": {"input": fragment}}}));
+        test:assertEquals(call.index, 0, "every fragment must carry the same accumulation index");
+        test:assertEquals(call?.id, (), "id is sent on the first fragment only");
+        test:assertEquals(call?.name, (), "name is sent on the first fragment only");
+        test:assertEquals(call?.arguments, fragment, "each fragment is forwarded raw");
+        reassembled += call?.arguments ?: "";
     }
     test:assertEquals(reassembled, "{\"city\":\"Paris\"}",
             "concatenating the streamed fragments must rebuild the full argument JSON");
@@ -105,36 +127,44 @@ function testConverseStreamRenumbersToolCallsFromZero() {
     // the raw block ordinals, which would leave a hole at 0.
     ConverseStreamDecoder decoder = new;
 
-    ai:ChatCompletionChunk _ = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
+    ai:ChatMessageChunk _ = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
             {"contentBlockIndex": 0, "delta": {"text": "working on it"}});
 
-    ai:ChatCompletionChunk first = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_START,
+    ai:ChatMessageChunk first = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_START,
             {"contentBlockIndex": 1, "start": {"toolUse": {"toolUseId": "a", "name": "one"}}});
-    ai:ChatCompletionChunk second = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_START,
+    ai:ChatMessageChunk second = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_START,
             {"contentBlockIndex": 2, "start": {"toolUse": {"toolUseId": "b", "name": "two"}}});
 
-    test:assertEquals((<ai:ToolCallChunk[]>deltaOf(first).toolCalls)[0].index, 0);
-    test:assertEquals((<ai:ToolCallChunk[]>deltaOf(second).toolCalls)[0].index, 1);
+    test:assertEquals(toolCallOf(first).index, 0);
+    test:assertEquals(toolCallOf(second).index, 1);
 
     // A later fragment for block 1 must map back to the SAME tool index, not a new one.
-    ai:ChatCompletionChunk more = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
+    ai:ChatMessageChunk more = decodeOne(decoder, CONVERSE_EVT_CONTENT_BLOCK_DELTA,
             {"contentBlockIndex": 1, "delta": {"toolUse": {"input": "{}"}}});
-    test:assertEquals((<ai:ToolCallChunk[]>deltaOf(more).toolCalls)[0].index, 0);
+    test:assertEquals(toolCallOf(more).index, 0);
 }
 
 @test:Config {}
 function testConverseStreamMapsStopReasonAndUsage() {
     ConverseStreamDecoder decoder = new;
 
-    ai:ChatCompletionChunk stopped = decodeOne(decoder, CONVERSE_EVT_MESSAGE_STOP, {"stopReason": "tool_use"});
-    test:assertEquals(stopped.choices[0].finishReason, ai:TOOL_CALLS);
+    ai:ChatMessageChunk stopped = decodeOne(decoder, CONVERSE_EVT_MESSAGE_STOP, {"stopReason": "tool_use"});
+    test:assertEquals(stopped.finishReason, ai:TOOL_CALLS);
+    test:assertEquals(stopped.content, ());
 
-    ai:ChatCompletionChunk metadata = decodeOne(decoder, CONVERSE_EVT_METADATA,
+    // Usage goes to the span, not to the caller: `metadata` yields no chunk.
+    StreamUpdate metadata = decodeUpdate(decoder, CONVERSE_EVT_METADATA,
             {"usage": {"inputTokens": 12, "outputTokens": 34, "totalTokens": 46}});
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>metadata?.usage;
-    test:assertEquals(usage?.promptTokens, 12);
-    test:assertEquals(usage?.completionTokens, 34);
-    test:assertEquals(usage?.totalTokens, 46);
+    test:assertEquals(metadata?.chunk, ());
+    test:assertEquals(metadata?.usage, {inputTokens: 12, outputTokens: 34});
+}
+
+@test:Config {}
+function testConverseStreamUnknownStopReasonDoesNotFailTheStream() {
+    ConverseStreamDecoder decoder = new;
+    StreamUpdate|ai:Error? update = decoder.decode(CONVERSE_EVT_MESSAGE_STOP, {"stopReason": "something_new"});
+    test:assertFalse(update is ai:Error, "an unknown stop reason must never fail the stream");
+    test:assertTrue(yieldsNoChunk(update), "a finish-only chunk with no known reason carries nothing");
 }
 
 @test:Config {}
@@ -160,54 +190,57 @@ function testConverseFinishReasonMapping() {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic on Invoke
+// Anthropic on Invoke (and Mantle Messages)
 // ---------------------------------------------------------------------------
 
 @test:Config {}
-function testAnthropicStreamMapsMessageStartIdentityAndInputTokens() {
+function testAnthropicStreamMessageStartYieldsIdAndInputTokensButNoChunk() {
     AnthropicStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, "chunk", {
+    StreamUpdate update = decodeUpdate(decoder, "chunk", {
         "type": "message_start",
         "message": {
             "id": "msg_01ABC",
             "model": "claude-sonnet-5",
             "role": "assistant",
-            "usage": {"input_tokens": 25}
+            "usage": {"input_tokens": 25, "output_tokens": 1}
         }
     });
-    test:assertEquals(chunk.id, "msg_01ABC");
-    test:assertEquals(chunk.model, "claude-sonnet-5");
-    test:assertEquals(deltaOf(chunk).role, ai:ASSISTANT);
-    // Anthropic splits usage across two events. The input half is STASHED, not
-    // emitted here: `ai` documents usage as present only on the final chunk, so it
-    // is rejoined with the output half on `message_delta` — see the test below.
-    test:assertEquals(chunk?.usage, (), "the opening chunk must carry no partial usage");
+    test:assertEquals(update?.chunk, (), "a message-start marker carries nothing for the caller");
+    test:assertEquals(update?.responseId, "msg_01ABC");
+    test:assertEquals(update?.usage, {inputTokens: 25});
 }
 
 @test:Config {}
 function testAnthropicStreamStreamsToolCallArgumentFragments() {
     AnthropicStreamDecoder decoder = new;
 
-    ai:ChatCompletionChunk opened = decodeOne(decoder, "chunk", {
+    ai:ToolCallChunk opened = toolCallOf(decodeOne(decoder, "chunk", {
         "type": "content_block_start",
         "index": 1,
-        "content_block": {"type": "tool_use", "id": "toolu_9", "name": "lookup"}
-    });
-    ai:ToolCallChunk[] openCalls = <ai:ToolCallChunk[]>deltaOf(opened).toolCalls;
-    test:assertEquals(openCalls[0].id, "toolu_9");
-    test:assertEquals(openCalls[0]?.'function?.name, "lookup");
-    test:assertEquals(openCalls[0].index, 0, "the first tool call is index 0 even though it is content block 1");
+        "content_block": {"type": "tool_use", "id": "toolu_9", "name": "lookup", "input": {}}
+    }));
+    test:assertEquals(opened?.id, "toolu_9");
+    test:assertEquals(opened?.name, "lookup");
+    test:assertEquals(opened.index, 0, "the first tool call is index 0 even though it is content block 1");
+
+    // Anthropic opens every tool block with an empty `partial_json`; it carries nothing.
+    test:assertTrue(yieldsNoChunk(decoder.decode("chunk", {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": ""}
+    })));
 
     string reassembled = "";
     foreach string fragment in ["{\"q\":", "\"bal\"}"] {
-        ai:ChatCompletionChunk chunk = decodeOne(decoder, "chunk", {
+        ai:ToolCallChunk call = toolCallOf(decodeOne(decoder, "chunk", {
             "type": "content_block_delta",
             "index": 1,
             "delta": {"type": "input_json_delta", "partial_json": fragment}
-        });
-        ai:ToolCallChunk[] calls = <ai:ToolCallChunk[]>deltaOf(chunk).toolCalls;
-        test:assertEquals(calls[0].index, 0);
-        reassembled += calls[0]?.'function?.arguments ?: "";
+        }));
+        test:assertEquals(call.index, 0);
+        test:assertEquals(call?.id, ());
+        test:assertEquals(call?.name, ());
+        reassembled += call?.arguments ?: "";
     }
     test:assertEquals(reassembled, "{\"q\":\"bal\"}");
 }
@@ -216,76 +249,54 @@ function testAnthropicStreamStreamsToolCallArgumentFragments() {
 function testAnthropicStreamMapsTextAndThinkingDeltas() {
     AnthropicStreamDecoder decoder = new;
 
-    ai:ChatCompletionChunk text = decodeOne(decoder, "chunk",
+    ai:ChatMessageChunk text = decodeOne(decoder, "chunk",
             {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Sure"}});
-    test:assertEquals(deltaOf(text).content, "Sure");
+    test:assertEquals(text.content, "Sure");
+    test:assertEquals(text.reasoning, ());
 
-    ai:ChatCompletionChunk thinking = decodeOne(decoder, "chunk",
+    ai:ChatMessageChunk thinking = decodeOne(decoder, "chunk",
             {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}});
-    test:assertEquals(deltaOf(thinking).reasoning, "hmm");
-    test:assertEquals(deltaOf(thinking).content, ());
+    test:assertEquals(thinking.reasoning, "hmm");
+    test:assertEquals(thinking.content, ());
 
     // The signature delta is the opaque replay token — skipped entirely.
-    test:assertTrue(decoder.decode("chunk",
-            {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "x"}}) is ());
+    test:assertTrue(yieldsNoChunk(decoder.decode("chunk",
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "x"}})));
 }
 
 @test:Config {}
 function testAnthropicStreamMapsMessageDeltaStopAndOutputTokens() {
     AnthropicStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, "chunk", {
+    StreamUpdate update = decodeUpdate(decoder, "chunk", {
         "type": "message_delta",
         "delta": {"stop_reason": "max_tokens"},
         "usage": {"output_tokens": 99}
     });
-    test:assertEquals(chunk.choices[0].finishReason, ai:LENGTH);
-    test:assertEquals((<ai:CompletionTokenUsage>chunk?.usage)?.completionTokens, 99);
+    ai:ChatMessageChunk chunk = <ai:ChatMessageChunk>update?.chunk;
+    test:assertEquals(chunk.finishReason, ai:LENGTH);
+    test:assertEquals(chunk.content, ());
+    test:assertEquals(update?.usage, {outputTokens: 99});
 }
 
 @test:Config {}
-function testAnthropicStreamRejoinsBothHalvesOfUsageOnTheFinalChunk() {
-    // The two halves arrive on different events; a caller reading `usage` off the
-    // last chunk — the natural reading, and what the non-streaming path returns —
-    // must see both, plus the total Anthropic never sends.
+function testAnthropicStreamUnknownStopReasonKeepsTheUsage() {
+    // An unrecognised reason maps to `()` — no finish-only chunk — but the output
+    // count on the same event still reaches the span, and the stream does not fail.
     AnthropicStreamDecoder decoder = new;
-    _ = decodeOne(decoder, "chunk", {
-        "type": "message_start",
-        "message": {"id": "msg_1", "role": "assistant", "usage": {"input_tokens": 25}}
-    });
-    ai:ChatCompletionChunk last = decodeOne(decoder, "chunk", {
+    StreamUpdate update = decodeUpdate(decoder, "chunk", {
         "type": "message_delta",
-        "delta": {"stop_reason": "end_turn"},
-        "usage": {"output_tokens": 99}
+        "delta": {"stop_reason": "brand_new_reason"},
+        "usage": {"output_tokens": 7}
     });
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>last?.usage;
-    test:assertEquals(usage?.promptTokens, 25);
-    test:assertEquals(usage?.completionTokens, 99);
-    test:assertEquals(usage?.totalTokens, 124, "totalTokens is derived — Anthropic reports no total");
-}
-
-@test:Config {}
-function testAnthropicStreamKeepsThePromptHalfWhenNoOutputCountArrives() {
-    // A `message_delta` with no `usage` must not drop the only count the response
-    // reported.
-    AnthropicStreamDecoder decoder = new;
-    _ = decodeOne(decoder, "chunk", {
-        "type": "message_start",
-        "message": {"role": "assistant", "usage": {"input_tokens": 25}}
-    });
-    ai:ChatCompletionChunk last = decodeOne(decoder, "chunk", {
-        "type": "message_delta",
-        "delta": {"stop_reason": "end_turn"}
-    });
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>last?.usage;
-    test:assertEquals(usage?.promptTokens, 25);
-    test:assertEquals(usage?.completionTokens, ());
+    test:assertEquals(update?.chunk, ());
+    test:assertEquals(update?.usage, {outputTokens: 7});
 }
 
 @test:Config {}
 function testAnthropicStreamSurfacesAnErrorEvent() {
     // A mid-stream failure must not look like a clean end of generation.
     AnthropicStreamDecoder decoder = new;
-    ai:ChatCompletionChunk|ai:Error? result = decoder.decode("chunk",
+    StreamUpdate|ai:Error? result = decoder.decode("chunk",
             {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}});
     if result !is ai:Error {
         test:assertFail("an error event must surface as an ai:Error");
@@ -300,6 +311,9 @@ function testAnthropicStreamSkipsPingAndStops() {
     test:assertTrue(decoder.decode("chunk", {"type": "ping"}) is ());
     test:assertTrue(decoder.decode("chunk", {"type": "content_block_stop", "index": 0}) is ());
     test:assertTrue(decoder.decode("chunk", {"type": "message_stop"}) is ());
+    // A text block's opening event carries an empty text — nothing for the caller.
+    test:assertTrue(yieldsNoChunk(decoder.decode("chunk",
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})));
 }
 
 @test:Config {}
@@ -426,7 +440,7 @@ function testArnRoutedModelStillResolvesAStreamDialect() returns error? {
     // REGRESSION. The dialect used to be looked up from `bareModelId`, which for an
     // opaque ARN IS the ARN string — matching no vendor prefix. So an ARN-routed model
     // got a converter claiming streaming and then failed dialect selection every time:
-    // `chat()` worked and `chatStream()` never did, with an internal-sounding
+    // `chat()` worked and streaming never did, with an internal-sounding
     // "No streaming dialect for 'arn:aws:...'" message. Hanging the dialect off the
     // converter is what made that unrepresentable.
     Route provisioned = check resolveRoute(
@@ -460,8 +474,8 @@ function testNovaInvokeNamesItsEventInThePayloadKey() {
     test:assertEquals(eventType, CONVERSE_EVT_CONTENT_BLOCK_DELTA);
 
     ConverseStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, eventType, payload);
-    test:assertEquals(deltaOf(chunk).content, "hi");
+    ai:ChatMessageChunk chunk = decodeOne(decoder, eventType, payload);
+    test:assertEquals(chunk.content, "hi");
 }
 
 @test:Config {}
@@ -479,12 +493,7 @@ function testNovaInvokeMetadataFrameCarriesInvocationMetricsAlongside() {
     test:assertEquals(eventType, CONVERSE_EVT_METADATA);
 
     ConverseStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, eventType, payload);
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunk?.usage;
-    test:assertEquals(usage?.promptTokens, 7);
-    test:assertEquals(usage?.completionTokens, 6);
-    // Nova omits `totalTokens` on Invoke, unlike ConverseStream, which sends all three.
-    test:assertEquals(usage?.totalTokens, ());
+    test:assertEquals(decodeUpdate(decoder, eventType, payload)?.usage, {inputTokens: 7, outputTokens: 6});
 }
 
 @test:Config {}
@@ -523,16 +532,17 @@ const string NO_EVENT_NAME = "";
 @test:Config {}
 function testOpenAIChatStreamMapsDeltaContentAndIdentity() {
     OpenAIChatStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, NO_EVENT_NAME, {
+    StreamUpdate update = decodeUpdate(decoder, NO_EVENT_NAME, {
         "id": "chatcmpl-1",
         "model": "zai.glm-5",
         "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}, "finish_reason": null}]
     });
-    test:assertEquals(deltaOf(chunk).content, "Hel");
-    test:assertEquals(deltaOf(chunk).role, ai:ASSISTANT);
-    // Unlike Converse, this dialect names itself — the iterator must not overwrite it.
-    test:assertEquals(chunk.id, "chatcmpl-1");
-    test:assertEquals(chunk.model, "zai.glm-5");
+    ai:ChatMessageChunk chunk = <ai:ChatMessageChunk>update?.chunk;
+    test:assertEquals(chunk.content, "Hel");
+    test:assertEquals(chunk.role, ai:ASSISTANT);
+    test:assertEquals(chunk.finishReason, ());
+    // Unlike Converse, this dialect names itself.
+    test:assertEquals(update?.responseId, "chatcmpl-1");
 }
 
 @test:Config {}
@@ -540,10 +550,10 @@ function testOpenAIChatStreamMapsReasoningToItsOwnField() {
     // DeepSeek V3.x and Qwen-with-thinking stream chain-of-thought in a separate
     // member; it must never merge into the answer text.
     OpenAIChatStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, NO_EVENT_NAME,
+    ai:ChatMessageChunk chunk = decodeOne(decoder, NO_EVENT_NAME,
             {"choices": [{"delta": {"reasoning_content": "let me think"}}]});
-    test:assertEquals(deltaOf(chunk).reasoning, "let me think");
-    test:assertEquals(deltaOf(chunk).content, (), "reasoning must not leak into the answer text");
+    test:assertEquals(chunk.reasoning, "let me think");
+    test:assertEquals(chunk.content, (), "reasoning must not leak into the answer text");
 }
 
 @test:Config {}
@@ -552,51 +562,60 @@ function testOpenAIChatStreamForwardsTheVendorsToolCallIndex() {
     // from 0 — it is the field `ai:ToolCallChunk.index` was modelled on. Renumbering
     // it would mis-order parallel calls.
     OpenAIChatStreamDecoder decoder = new;
-    ai:ChatCompletionChunk first = decodeOne(decoder, NO_EVENT_NAME, {
+    ai:ChatMessageChunk first = decodeOne(decoder, NO_EVENT_NAME, {
         "choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": "call_a", "type": "function", "function": {"name": "getWeather", "arguments": ""}},
             {"index": 1, "id": "call_b", "type": "function", "function": {"name": "getTime", "arguments": ""}}
         ]}}]
     });
-    ai:ToolCallChunk[] calls = <ai:ToolCallChunk[]>deltaOf(first).toolCalls;
+    ai:ToolCallChunk[] calls = <ai:ToolCallChunk[]>first.toolCalls;
     test:assertEquals(calls.length(), 2);
-    test:assertEquals(calls[0].index, 0);
-    test:assertEquals(calls[0].id, "call_a");
-    test:assertEquals(calls[0].'function?.name, "getWeather");
-    test:assertEquals(calls[1].index, 1);
-    test:assertEquals(calls[1].id, "call_b");
+    test:assertEquals(calls[0], {index: 0, id: "call_a", name: "getWeather"});
+    test:assertEquals(calls[1], {index: 1, id: "call_b", name: "getTime"});
 
     // Argument fragments arrive later with the index and nothing else.
-    ai:ChatCompletionChunk args = decodeOne(decoder, NO_EVENT_NAME,
+    ai:ChatMessageChunk args = decodeOne(decoder, NO_EVENT_NAME,
             {"choices": [{"delta": {"tool_calls": [{"index": 1, "function": {"arguments": "{\"tz\":"}}]}}]});
-    ai:ToolCallChunk[] fragment = <ai:ToolCallChunk[]>deltaOf(args).toolCalls;
-    test:assertEquals(fragment[0].index, 1);
-    test:assertEquals(fragment[0].'function?.arguments, "{\"tz\":");
+    test:assertEquals(toolCallOf(args), {index: 1, arguments: "{\"tz\":"});
+}
+
+@test:Config {}
+function testOpenAIChatStreamSendsIdAndNameOnTheFirstFragmentOnly() {
+    // Some vendors repeat the call's id and name on every fragment. The contract
+    // sends them once, so a caller's accumulator never sees a second "start".
+    OpenAIChatStreamDecoder decoder = new;
+    ai:ChatMessageChunk first = decodeOne(decoder, NO_EVENT_NAME, {"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "call_a", "function": {"name": "lookup", "arguments": "{\"q\":"}}
+    ]}}]});
+    test:assertEquals(toolCallOf(first), {index: 0, id: "call_a", name: "lookup", arguments: "{\"q\":"});
+
+    ai:ChatMessageChunk again = decodeOne(decoder, NO_EVENT_NAME, {"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "call_a", "function": {"name": "lookup", "arguments": "\"x\"}"}}
+    ]}}]});
+    test:assertEquals(toolCallOf(again), {index: 0, arguments: "\"x\"}"});
 }
 
 @test:Config {}
 function testOpenAIChatStreamReadsUsageOffTheFinalEmptyChoicesChunk() {
     // With `stream_options: {include_usage: true}` the last chunk carries usage and
-    // an EMPTY choices array — so a length check alone would drop it.
+    // an EMPTY choices array — usage for the span, nothing for the caller.
     OpenAIChatStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, NO_EVENT_NAME, {
+    StreamUpdate update = decodeUpdate(decoder, NO_EVENT_NAME, {
         "choices": [],
         "usage": {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33}
     });
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunk?.usage;
-    test:assertEquals(usage.promptTokens, 11);
-    test:assertEquals(usage.completionTokens, 22);
-    test:assertEquals(usage.totalTokens, 33);
+    test:assertEquals(update?.chunk, ());
+    test:assertEquals(update?.usage, {inputTokens: 11, outputTokens: 22});
 }
 
 @test:Config {}
 function testOpenAIChatStreamIgnoresTheNullUsageOnEveryOtherChunk() {
-    // `"usage": null` rides every non-final chunk. Emitting a usage record of zeroes
-    // for each one would overwrite the real totals on the span.
+    // `"usage": null` rides every non-final chunk. A usage record of zeroes for each
+    // one would overwrite the real totals on the span.
     OpenAIChatStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, NO_EVENT_NAME,
+    StreamUpdate update = decodeUpdate(decoder, NO_EVENT_NAME,
             {"choices": [{"delta": {"content": "x"}}], "usage": null});
-    test:assertTrue(chunk?.usage is (), "a null usage must not become a usage record");
+    test:assertEquals(update?.usage, (), "a null usage must not become a usage record");
 }
 
 @test:Config {}
@@ -604,12 +623,12 @@ function testOpenAIChatStreamAcceptsMistralsStopReasonSpelling() {
     // Mistral spells the field `stop_reason` where OpenAI says `finish_reason`. That
     // one difference is why the two share this decoder instead of getting two.
     OpenAIChatStreamDecoder decoder = new;
-    ai:ChatCompletionChunk mistral = decodeOne(decoder, NO_EVENT_NAME,
+    ai:ChatMessageChunk mistral = decodeOne(decoder, NO_EVENT_NAME,
             {"choices": [{"message": {"content": "done"}, "stop_reason": "stop"}]});
-    test:assertEquals(mistral.choices[0].finishReason, ai:STOP);
+    test:assertEquals(mistral.finishReason, ai:STOP);
     // ... and Mistral reuses the BUFFERED `message` member on the stream, which is
     // why the decoder falls back to it.
-    test:assertEquals(deltaOf(mistral).content, "done");
+    test:assertEquals(mistral.content, "done");
 }
 
 @test:Config {}
@@ -618,20 +637,20 @@ function testOpenAIChatStreamReadsBedrocksInvocationMetrics() {
     // onto the last frame instead. Dropping them loses the only token accounting the
     // route ever produces.
     OpenAIChatStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, NO_EVENT_NAME, {
+    StreamUpdate update = decodeUpdate(decoder, NO_EVENT_NAME, {
         "choices": [{"delta": {"content": ""}, "finish_reason": "stop"}],
         "amazon-bedrock-invocationMetrics": {"inputTokenCount": 7, "outputTokenCount": 5}
     });
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunk?.usage;
-    test:assertEquals(usage.promptTokens, 7);
-    test:assertEquals(usage.completionTokens, 5);
-    test:assertEquals(usage.totalTokens, 12, "the metrics block reports no total; it is derived");
+    ai:ChatMessageChunk chunk = <ai:ChatMessageChunk>update?.chunk;
+    test:assertEquals(chunk.finishReason, ai:STOP);
+    test:assertEquals(chunk.content, (), "an empty content fragment is not forwarded");
+    test:assertEquals(update?.usage, {inputTokens: 7, outputTokens: 5});
 }
 
 @test:Config {}
 function testOpenAIChatStreamSurfacesAnInBandError() {
     OpenAIChatStreamDecoder decoder = new;
-    ai:ChatCompletionChunk|ai:Error? result = decoder.decode(NO_EVENT_NAME,
+    StreamUpdate|ai:Error? result = decoder.decode(NO_EVENT_NAME,
             {"error": {"type": "server_error", "message": "upstream failed"}});
     if result !is ai:Error {
         test:assertFail("an in-band error object must end the stream");
@@ -651,6 +670,24 @@ function testOpenAIChatFinishReasonMapping() {
     test:assertEquals(mapOpenAIFinishReason(()), ());
 }
 
+@test:Config {}
+function testOpenAIChatStreamSkipsAnEventThatCarriesNothing() {
+    // Some vendors interleave no-news objects between real chunks, and every stream
+    // opens with a role-only delta. Emitting them hands the caller empty chunks to
+    // filter out of its own output.
+    OpenAIChatStreamDecoder decoder = new;
+    test:assertTrue(decoder.decode(NO_EVENT_NAME, {"choices": [{"delta": {}}]}) is ());
+    test:assertTrue(yieldsNoChunk(decoder.decode(NO_EVENT_NAME,
+            {"id": "chatcmpl-1", "object": "chat.completion.chunk"})));
+    test:assertTrue(yieldsNoChunk(decoder.decode(NO_EVENT_NAME,
+            {"id": "chatcmpl-1", "choices": [{"delta": {"role": "assistant", "content": ""}}]})),
+            "a role-only opener carries nothing: the role is on every chunk anyway");
+    // ... but a chunk whose ONLY content is the finish reason still counts.
+    ai:ChatMessageChunk done = decodeOne(decoder, NO_EVENT_NAME,
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]});
+    test:assertEquals(done.finishReason, ai:STOP);
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI Responses — Mantle only
 // ---------------------------------------------------------------------------
@@ -658,15 +695,14 @@ function testOpenAIChatFinishReasonMapping() {
 @test:Config {}
 function testResponsesStreamMapsCreatedAndTextDeltas() {
     ResponsesStreamDecoder decoder = new;
-    ai:ChatCompletionChunk created = decodeOne(decoder, RESPONSES_EVT_CREATED,
+    StreamUpdate created = decodeUpdate(decoder, RESPONSES_EVT_CREATED,
             {"type": RESPONSES_EVT_CREATED, "response": {"id": "resp_1", "model": "openai.gpt-5.5"}});
-    test:assertEquals(created.id, "resp_1");
-    test:assertEquals(created.model, "openai.gpt-5.5");
-    test:assertEquals(deltaOf(created).role, ai:ASSISTANT, "the role arrives once, on the opening event");
+    test:assertEquals(created?.chunk, (), "the lifecycle opener carries nothing for the caller");
+    test:assertEquals(created?.responseId, "resp_1");
 
-    ai:ChatCompletionChunk text = decodeOne(decoder, RESPONSES_EVT_OUTPUT_TEXT_DELTA,
+    ai:ChatMessageChunk text = decodeOne(decoder, RESPONSES_EVT_OUTPUT_TEXT_DELTA,
             {"type": RESPONSES_EVT_OUTPUT_TEXT_DELTA, "output_index": 0, "delta": "Once upon"});
-    test:assertEquals(deltaOf(text).content, "Once upon");
+    test:assertEquals(text.content, "Once upon");
 }
 
 @test:Config {}
@@ -674,10 +710,10 @@ function testResponsesStreamMapsReasoningSummaryToReasoning() {
     // GPT-5.x returns a SUMMARY of its reasoning rather than the raw trace — readable
     // text either way, so it lands in `reasoning`, never in the answer.
     ResponsesStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, RESPONSES_EVT_REASONING_SUMMARY_DELTA,
+    ai:ChatMessageChunk chunk = decodeOne(decoder, RESPONSES_EVT_REASONING_SUMMARY_DELTA,
             {"type": RESPONSES_EVT_REASONING_SUMMARY_DELTA, "delta": "weighing options"});
-    test:assertEquals(deltaOf(chunk).reasoning, "weighing options");
-    test:assertEquals(deltaOf(chunk).content, ());
+    test:assertEquals(chunk.reasoning, "weighing options");
+    test:assertEquals(chunk.content, ());
 }
 
 @test:Config {}
@@ -685,39 +721,33 @@ function testResponsesStreamRenumbersToolCallsFromZero() {
     // `output_index` counts OUTPUT ITEMS — messages and reasoning items included — so
     // a tool call announced at item 1 must still be tool-call 0 for the caller.
     ResponsesStreamDecoder decoder = new;
-    ai:ChatCompletionChunk added = decodeOne(decoder, RESPONSES_EVT_OUTPUT_ITEM_ADDED, {
+    ai:ToolCallChunk added = toolCallOf(decodeOne(decoder, RESPONSES_EVT_OUTPUT_ITEM_ADDED, {
         "type": RESPONSES_EVT_OUTPUT_ITEM_ADDED,
         "output_index": 1,
         "item": {"type": "function_call", "id": "fc_1", "call_id": "call_abc", "name": "getWeather"}
-    });
-    ai:ToolCallChunk[] calls = <ai:ToolCallChunk[]>deltaOf(added).toolCalls;
-    test:assertEquals(calls[0].index, 0, "the first tool call is tool-call 0, whatever its item ordinal");
-    test:assertEquals(calls[0].id, "call_abc", "a tool result is addressed to call_id, not to the item id");
-    test:assertEquals(calls[0].'function?.name, "getWeather");
+    }));
+    test:assertEquals(added.index, 0, "the first tool call is tool-call 0, whatever its item ordinal");
+    test:assertEquals(added?.id, "call_abc", "a tool result is addressed to call_id, not to the item id");
+    test:assertEquals(added?.name, "getWeather");
 
     // Arguments arrive on their own events, correlated by the same output_index.
-    ai:ChatCompletionChunk args = decodeOne(decoder, RESPONSES_EVT_FUNCTION_ARGS_DELTA,
-            {"type": RESPONSES_EVT_FUNCTION_ARGS_DELTA, "output_index": 1, "delta": "{\"city\":"});
-    ai:ToolCallChunk[] fragment = <ai:ToolCallChunk[]>deltaOf(args).toolCalls;
-    test:assertEquals(fragment[0].index, 0, "the fragment must join the call it belongs to");
-    test:assertEquals(fragment[0].'function?.arguments, "{\"city\":");
+    ai:ToolCallChunk fragment = toolCallOf(decodeOne(decoder, RESPONSES_EVT_FUNCTION_ARGS_DELTA,
+            {"type": RESPONSES_EVT_FUNCTION_ARGS_DELTA, "output_index": 1, "delta": "{\"city\":"}));
+    test:assertEquals(fragment, {index: 0, arguments: "{\"city\":"}, "the fragment must join the call it belongs to");
 }
 
 @test:Config {}
 function testResponsesStreamMapsTerminalStatusAndUsage() {
     ResponsesStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, RESPONSES_EVT_COMPLETED, {
+    StreamUpdate update = decodeUpdate(decoder, RESPONSES_EVT_COMPLETED, {
         "type": RESPONSES_EVT_COMPLETED,
         "response": {
             "status": "completed",
             "usage": {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42}
         }
     });
-    test:assertEquals(chunk.choices[0].finishReason, ai:STOP);
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunk?.usage;
-    test:assertEquals(usage.promptTokens, 30);
-    test:assertEquals(usage.completionTokens, 12);
-    test:assertEquals(usage.totalTokens, 42);
+    test:assertEquals((<ai:ChatMessageChunk>update?.chunk).finishReason, ai:STOP);
+    test:assertEquals(update?.usage, {inputTokens: 30, outputTokens: 12});
 }
 
 @test:Config {}
@@ -731,26 +761,26 @@ function testResponsesStreamReportsToolCallsAsTheFinishReason() {
         "output_index": 0,
         "item": {"type": "function_call", "call_id": "call_1", "name": "lookup"}
     });
-    ai:ChatCompletionChunk done = decodeOne(decoder, RESPONSES_EVT_COMPLETED,
+    ai:ChatMessageChunk done = decodeOne(decoder, RESPONSES_EVT_COMPLETED,
             {"type": RESPONSES_EVT_COMPLETED, "response": {"status": "completed"}});
-    test:assertEquals(done.choices[0].finishReason, ai:TOOL_CALLS);
+    test:assertEquals(done.finishReason, ai:TOOL_CALLS);
 }
 
 @test:Config {}
 function testResponsesStreamMapsAnIncompleteResponseToLength() {
     ResponsesStreamDecoder decoder = new;
-    ai:ChatCompletionChunk truncated = decodeOne(decoder, RESPONSES_EVT_INCOMPLETE, {
+    ai:ChatMessageChunk truncated = decodeOne(decoder, RESPONSES_EVT_INCOMPLETE, {
         "type": RESPONSES_EVT_INCOMPLETE,
         "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
     });
-    test:assertEquals(truncated.choices[0].finishReason, ai:LENGTH);
+    test:assertEquals(truncated.finishReason, ai:LENGTH);
 
     ResponsesStreamDecoder filtered = new;
-    ai:ChatCompletionChunk blocked = decodeOne(filtered, RESPONSES_EVT_INCOMPLETE, {
+    ai:ChatMessageChunk blocked = decodeOne(filtered, RESPONSES_EVT_INCOMPLETE, {
         "type": RESPONSES_EVT_INCOMPLETE,
         "response": {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}}
     });
-    test:assertEquals(blocked.choices[0].finishReason, ai:CONTENT_FILTER);
+    test:assertEquals(blocked.finishReason, ai:CONTENT_FILTER);
 }
 
 @test:Config {}
@@ -767,7 +797,7 @@ function testResponsesStreamSkipsTheRestatingLifecycleEvents() {
 @test:Config {}
 function testResponsesStreamSurfacesAFailure() {
     ResponsesStreamDecoder decoder = new;
-    ai:ChatCompletionChunk|ai:Error? result = decoder.decode(RESPONSES_EVT_FAILED, {
+    StreamUpdate|ai:Error? result = decoder.decode(RESPONSES_EVT_FAILED, {
         "type": RESPONSES_EVT_FAILED,
         "response": {"status": "failed", "error": {"code": "server_error", "message": "model unavailable"}}
     });
@@ -782,8 +812,8 @@ function testResponsesStreamFallsBackToTheEventNameWhenThePayloadIsUnnamed() {
     // The name arrives twice — the SSE `event:` line and the payload's `type`. The
     // payload wins, but a payload without one must still decode.
     ResponsesStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, RESPONSES_EVT_OUTPUT_TEXT_DELTA, {"delta": "hi"});
-    test:assertEquals(deltaOf(chunk).content, "hi");
+    ai:ChatMessageChunk chunk = decodeOne(decoder, RESPONSES_EVT_OUTPUT_TEXT_DELTA, {"delta": "hi"});
+    test:assertEquals(chunk.content, "hi");
 }
 
 // ---------------------------------------------------------------------------
@@ -795,39 +825,39 @@ function testTextCompletionStreamReadsEitherVendorsArrayKey() {
     // One decoder, two dialects: Mistral wraps in `outputs`, DeepSeek in `choices`,
     // and on the stream nothing else tells them apart.
     TextCompletionStreamDecoder mistral = new;
-    ai:ChatCompletionChunk fromOutputs = decodeOne(mistral, "chunk",
+    ai:ChatMessageChunk fromOutputs = decodeOne(mistral, "chunk",
             {"outputs": [{"text": "Bon", "stop_reason": null}]});
-    test:assertEquals(deltaOf(fromOutputs).content, "Bon");
+    test:assertEquals(fromOutputs.content, "Bon");
+    test:assertEquals(fromOutputs.finishReason, ());
 
     TextCompletionStreamDecoder deepseek = new;
-    ai:ChatCompletionChunk fromChoices = decodeOne(deepseek, "chunk",
+    ai:ChatMessageChunk fromChoices = decodeOne(deepseek, "chunk",
             {"choices": [{"text": "jour", "stop_reason": null}]});
-    test:assertEquals(deltaOf(fromChoices).content, "jour");
+    test:assertEquals(fromChoices.content, "jour");
 }
 
 @test:Config {}
 function testTextCompletionStreamMapsStopReasonAndMetrics() {
     TextCompletionStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, "chunk", {
+    StreamUpdate update = decodeUpdate(decoder, "chunk", {
         "outputs": [{"text": "!", "stop_reason": "length"}],
         "amazon-bedrock-invocationMetrics": {"inputTokenCount": 4, "outputTokenCount": 96}
     });
-    test:assertEquals(deltaOf(chunk).content, "!");
-    test:assertEquals(chunk.choices[0].finishReason, ai:LENGTH);
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunk?.usage;
-    test:assertEquals(usage.promptTokens, 4);
-    test:assertEquals(usage.completionTokens, 96);
+    ai:ChatMessageChunk chunk = <ai:ChatMessageChunk>update?.chunk;
+    test:assertEquals(chunk.content, "!");
+    test:assertEquals(chunk.finishReason, ai:LENGTH);
+    test:assertEquals(update?.usage, {inputTokens: 4, outputTokens: 96});
 }
 
 @test:Config {}
-function testTextCompletionStreamEmitsAMetricsOnlyFrameAsUsage() {
-    // The metrics can arrive on a frame of their own, after the last text.
+function testTextCompletionStreamEmitsAMetricsOnlyFrameAsUsageOnly() {
+    // The metrics can arrive on a frame of their own, after the last text. That is
+    // usage for the span — not a chunk for the caller.
     TextCompletionStreamDecoder decoder = new;
-    ai:ChatCompletionChunk chunk = decodeOne(decoder, "chunk",
+    StreamUpdate update = decodeUpdate(decoder, "chunk",
             {"amazon-bedrock-invocationMetrics": {"inputTokenCount": 3, "outputTokenCount": 9}});
-    test:assertEquals(deltaOf(chunk).content, (), "a usage-only chunk carries no text");
-    ai:CompletionTokenUsage usage = <ai:CompletionTokenUsage>chunk?.usage;
-    test:assertEquals(usage.totalTokens, 12);
+    test:assertEquals(update?.chunk, ());
+    test:assertEquals(update?.usage, {inputTokens: 3, outputTokens: 9});
 }
 
 @test:Config {}
@@ -837,22 +867,4 @@ function testTextCompletionStreamSkipsAnEventItCannotRead() {
     // streaming example, so an unexpected frame must not kill a good stream.
     TextCompletionStreamDecoder decoder = new;
     test:assertTrue(decoder.decode("chunk", {"something": "else"}) is ());
-}
-
-@test:Config {}
-function testOpenAIChatStreamSkipsAnEventThatCarriesNothing() {
-    // Some vendors interleave no-news objects between real chunks. Emitting them
-    // hands the caller chunks with an empty delta to filter out of its own output —
-    // the same reason `contentBlockStop` is skipped on Converse.
-    OpenAIChatStreamDecoder decoder = new;
-    test:assertTrue(decoder.decode(NO_EVENT_NAME, {"choices": [{"delta": {}}]}) is ());
-    test:assertTrue(decoder.decode(NO_EVENT_NAME, {"id": "chatcmpl-1", "object": "chat.completion.chunk"}) is ());
-    // ... but a chunk whose ONLY content is the finish reason still counts.
-    ai:ChatCompletionChunk done = decodeOne(decoder, NO_EVENT_NAME,
-            {"choices": [{"delta": {}, "finish_reason": "stop"}]});
-    test:assertEquals(done.choices[0].finishReason, ai:STOP);
-    // ... as does a role-only opener.
-    ai:ChatCompletionChunk opener = decodeOne(decoder, NO_EVENT_NAME,
-            {"choices": [{"delta": {"role": "assistant"}}]});
-    test:assertEquals(deltaOf(opener).role, ai:ASSISTANT);
 }

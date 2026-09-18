@@ -139,7 +139,7 @@ public isolated distinct client class AmazonModelProvider {
         'class: "io.ballerina.lib.ai.aws.bedrock.Generator"
     } external;
 
-    # Sends a chat request and streams the reply as normalized chunks.
+    # Sends a chat request and streams the reply as `ai:ChatMessageChunk`s.
     #
     # Supported on EVERY route this module resolves — the wire differs, the contract
     # does not: `ConverseStream` on Converse, `InvokeModelWithResponseStream` on
@@ -158,27 +158,22 @@ public isolated distinct client class AmazonModelProvider {
     # + messages - Chat messages or a single user message
     # + tools - Tool definitions for function calling
     # + stop - Stop sequence; overrides configured `stopSequences`
-    # + return - A stream of response chunks, or an `ai:Error`
-    remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
+    # + return - A stream of assistant message chunks, or an `ai:Error`
+    remote function chatAsStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools = [], string? stop = ())
-            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error
+            returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error
         => runChatStream("Amazon", self.family, self.wireModelId, self.converter,
             self.transport, self.extraHeaders, self.params, messages, tools, stop);
 
-    # Streams a generated value as it is produced. Only a `string` target type is
-    # supported — structured output is obtained by forcing a tool call, whose
-    # arguments cannot be bound until the whole JSON has arrived.
+    # Streams the answer to a prompt as text fragments. The request is built as
+    # `generate` builds it for a `string` result, on the same route.
     #
-    # External Java per the platform convention, as `generate`: a dependently typed
-    # function must be external. The shim calls back into
-    # `generateLlmResponseStream`, which projects `chatStream`'s chunks onto text.
+    # Streaming produces text only: structured types have no valid intermediate
+    # state, so use `generate` for structured output.
     #
     # + prompt - The prompt to use in the chat request
-    # + td - Type descriptor of the expected return type
     # + return - A stream of text fragments, or an `ai:Error`
-    remote function generateStream(ai:Prompt prompt,
-            @display {label: "Expected type"} typedesc<anydata> td = <>)
-            returns stream<td, ai:Error?>|ai:Error = @java:Method {
-        'class: "io.ballerina.lib.ai.aws.bedrock.StreamGenerator"
-    } external;
+    remote function generateAsStream(ai:Prompt prompt) returns stream<string, ai:Error?>|ai:Error
+        => runGenerateStream("Amazon", self.genFamily, self.genModelId, self.genConverter,
+            self.genTransport, self.genHeaders, self.params, prompt);
 }

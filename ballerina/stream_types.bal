@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import ballerina/ai;
+import ballerina/ai.observe;
 
 // Streaming contract plumbing: the wire-format-agnostic event source, the
 // per-response decoder shape, dialect selection, and the tool-index remapping every
@@ -51,21 +52,53 @@ type StreamEventSource object {
     isolated function close() returns ai:Error?;
 };
 
-# Converts ONE native stream event into the normalized `ai:ChatCompletionChunk`.
+# The span operations a chunk stream reports through. Structural, so both
+# `observe:ChatSpan` (`chatAsStream`) and `observe:GenerateContentSpan`
+# (`generateAsStream`) satisfy it.
+type StreamSpan isolated object {
+    public isolated function addInputTokenCount(int count);
+    public isolated function addOutputTokenCount(int count);
+    public isolated function addFinishReason(string|string[] reason);
+    public isolated function addOutputType(observe:OutputType outputType);
+    public isolated function addResponseId(string|int id);
+    public isolated function close(error? err = ());
+};
+
+# Token counts reported by a stream. They go to the observe span only:
+# `ai:ChatMessageChunk` has no usage member.
+type StreamUsage record {|
+    # Prompt tokens
+    int inputTokens?;
+    # Completion tokens
+    int outputTokens?;
+|};
+
+# What one native event contributes to the response.
+type StreamUpdate record {|
+    # The chunk to hand the caller. Absent for events that carry nothing for it —
+    # a message-start marker that only names the response, a usage-only closer.
+    ai:ChatMessageChunk chunk?;
+    # Token counts for the span.
+    StreamUsage usage?;
+    # The provider's own response/message id, where the event carries one.
+    string responseId?;
+|};
+
+# Converts ONE native stream event into a `StreamUpdate`.
 #
 # An OBJECT, not the plain function pointer the `encode`/`decode` converter members use,
 # because a stream decoder is inherently stateful: tool-call fragments have to be
 # correlated across events, and the ordinal a caller sees must be derived from that
-# running state. One instance per `chatStream` call.
+# running state. One instance per `chatAsStream` call.
 type StreamChunkDecoder object {
 
     # + eventType - The event's name. Names the event on Converse and Responses;
     #               always `chunk` on Invoke and often empty on SSE, where the
     #               dialect names it in the body
     # + payload - The event's decoded JSON body
-    # + return - The chunk to emit, `()` for an event with nothing to surface
+    # + return - What the event contributes, `()` for an event with nothing at all
     #            (`contentBlockStop`, `ping`, …), or an `ai:Error`
-    isolated function decode(string eventType, json payload) returns ai:ChatCompletionChunk|ai:Error?;
+    isolated function decode(string eventType, json payload) returns StreamUpdate|ai:Error?;
 };
 
 # Which native stream dialect a route speaks.
@@ -137,16 +170,17 @@ isolated function newStreamDecoder(StreamDialect dialect) returns StreamChunkDec
 # Maps a dialect's native content-block ordinal onto the tool-call `index` the `ai`
 # contract expects.
 #
-# WHY A REMAP RATHER THAN A PASSTHROUGH — both dialects number CONTENT BLOCKS, and a
-# tool call is only one KIND of block. A reply with text in block 0 and tool calls in
+# WHY A REMAP RATHER THAN A PASSTHROUGH — Converse, Anthropic and Responses have no
+# tool index of their own: they number CONTENT BLOCKS (or output items), and a tool
+# call is only one KIND of block. A reply with text in block 0 and tool calls in
 # blocks 1 and 2 would hand a caller tool indices 1 and 2. `ai:ToolCallChunk.index`
 # is the OpenAI-shaped "index used to accumulate fragments of the same tool call",
 # which numbers the TOOL CALLS, from 0. Forwarding the block ordinal is not merely
 # cosmetic: an accumulator that sizes its array from the indices it sees would leave
 # a hole at 0 and mis-order parallel calls.
 #
-# The OpenAI chat dialect needs no remap — its `tool_calls[].index` already numbers
-# the tool calls — which is why `OpenAIChatStreamDecoder` forwards it untouched.
+# The OpenAI chat dialect needs no remap — its `tool_calls[].index` IS a tool index —
+# which is why `OpenAIChatStreamDecoder` forwards it untouched.
 class ToolIndexMap {
     private map<int> byBlock = {};
     private int next = 0;
@@ -166,16 +200,35 @@ class ToolIndexMap {
     }
 }
 
-// A chunk carrying a single choice — the shape every event maps onto. Streamed
-// Bedrock responses have exactly one candidate, so `index` is always 0.
-isolated function singleChoiceChunk(ai:ChatCompletionChunkDelta delta, ai:FinishReason? finishReason = ())
-        returns ai:ChatCompletionChunk
-    => {choices: [{index: 0, delta, finishReason}]};
+// A text fragment as an update, or `()` for an absent or empty one — an empty
+// fragment carries nothing for the caller.
+isolated function contentUpdate(string? text) returns StreamUpdate? =>
+    text is string && text != "" ? {chunk: {role: ai:ASSISTANT, content: text}} : ();
 
-// A chunk that carries only token usage. `choices` is required by the contract, so
-// a usage-only event still emits an empty delta rather than omitting the choice.
-isolated function usageChunk(ai:CompletionTokenUsage usage) returns ai:ChatCompletionChunk
-    => {choices: [{index: 0, delta: {}, finishReason: ()}], usage};
+// A reasoning fragment as an update, or `()` for an absent or empty one.
+isolated function reasoningUpdate(string? text) returns StreamUpdate? =>
+    text is string && text != "" ? {chunk: {role: ai:ASSISTANT, reasoning: text}} : ();
+
+// A single tool-call fragment as an update.
+isolated function toolCallUpdate(ai:ToolCallChunk call) returns StreamUpdate =>
+    {chunk: {role: ai:ASSISTANT, toolCalls: [call]}};
+
+// A tool-call fragment. `id` and `name` belong on a call's first fragment only, and
+// an empty `arguments` string is dropped as carrying nothing.
+isolated function toolCallChunk(int index, string? id = (), string? name = (), string? arguments = ())
+        returns ai:ToolCallChunk {
+    ai:ToolCallChunk call = {index};
+    if id is string {
+        call.id = id;
+    }
+    if name is string {
+        call.name = name;
+    }
+    if arguments is string && arguments != "" {
+        call.arguments = arguments;
+    }
+    return call;
+}
 
 // Reads the token counts Bedrock staples onto the LAST frame of an
 // `InvokeModelWithResponseStream` response.
@@ -189,19 +242,25 @@ isolated function usageChunk(ai:CompletionTokenUsage usage) returns ai:ChatCompl
 //     {"choices":[…], "amazon-bedrock-invocationMetrics":
 //         {"inputTokenCount":12,"outputTokenCount":34,
 //          "invocationLatency":880,"firstByteLatency":320}}
-//
-// `totalTokens` is derived: the metrics block reports the two halves and no total.
-isolated function invocationMetricsUsage(map<json> payload) returns ai:CompletionTokenUsage? {
+isolated function invocationMetricsUsage(map<json> payload) returns StreamUsage? {
     map<json>? metrics = mapField(payload, "amazon-bedrock-invocationMetrics");
     if metrics is () {
         return ();
     }
-    int? inputTokens = intField(metrics, "inputTokenCount");
-    int? outputTokens = intField(metrics, "outputTokenCount");
+    return streamUsage(intField(metrics, "inputTokenCount"), intField(metrics, "outputTokenCount"));
+}
+
+// A usage record from two optional counts, or `()` when neither is present.
+isolated function streamUsage(int? inputTokens, int? outputTokens) returns StreamUsage? {
     if inputTokens is () && outputTokens is () {
         return ();
     }
-    int prompt = inputTokens ?: 0;
-    int completion = outputTokens ?: 0;
-    return {promptTokens: prompt, completionTokens: completion, totalTokens: prompt + completion};
+    StreamUsage usage = {};
+    if inputTokens is int {
+        usage.inputTokens = inputTokens;
+    }
+    if outputTokens is int {
+        usage.outputTokens = outputTokens;
+    }
+    return usage;
 }

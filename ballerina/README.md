@@ -149,20 +149,20 @@ ai:ChatAssistantMessage response = check claude->chat([
 ### Step 3b: Stream the reply
 
 ```ballerina
-stream<ai:ChatCompletionChunk, ai:Error?> chunks = check claude->chatStream([
+stream<ai:ChatMessageChunk, ai:Error?> chunks = check claude->chatAsStream([
     {role: ai:USER, content: "Why is the sky blue?"}
 ]);
-check from ai:ChatCompletionChunk chunk in chunks
+check from ai:ChatMessageChunk chunk in chunks
     do {
-        io:print(chunk.choices[0].delta.content ?: "");
+        io:print(chunk.content ?: "");
     };
 ```
 
-`generateStream()` is the text-only shortcut, projecting the same stream onto its content fragments and
-skipping the role opener, tool-call fragments and the usage closer:
+`generateAsStream()` is the text-only shortcut: it builds the request from the prompt the way `generate()`
+does and yields only the answer's text fragments, skipping reasoning, tool-call and finish-only chunks:
 
 ```ballerina
-stream<string, ai:Error?> text = check claude->generateStream(`Why is the sky blue?`);
+stream<string, ai:Error?> text = check claude->generateAsStream(`Why is the sky blue?`);
 ```
 
 **Every route streams** — Converse, Invoke and Mantle, for every vendor. The wire differs, the contract
@@ -170,13 +170,16 @@ does not: `bedrock-runtime` answers AWS's binary event-stream from a sibling ope
 (`converse-stream`, `invoke-with-response-stream`), while Mantle answers SSE from the *same* path,
 switched on by `"stream": true` in the body.
 
-Beyond `delta.content` a chunk may carry `delta.reasoning` (extended thinking — Claude and Nova stream
-it as readable text), `delta.toolCalls` (partial-JSON argument fragments, correlated by `index`),
-`finishReason` on the closing chunk, and `usage` on the final one.
+Every chunk carries `role: ai:ASSISTANT` and the same `id` (the model's message id where it sends one,
+otherwise the Bedrock request id). Beyond `content` a chunk may carry `reasoning` (extended thinking —
+Claude and Nova stream it as readable text), `toolCalls` (correlate fragments by `index`; `id` and
+`name` arrive on a call's first fragment, `arguments` as raw partial-JSON fragments to concatenate),
+and `finishReason` on the closing chunk. Token usage is reported to the observability span rather than
+on the chunks.
 
-**Only `string` streams.** `generateStream()` with any other target type is an `ai:Error`: a typed value
-comes out of a forced tool call, and the arguments cannot be bound until the whole JSON has arrived —
-there is no partial record to hand back. Use `generate()` for typed results.
+**Only text streams.** Structured types have no valid intermediate state — a typed value comes out of a
+forced tool call whose arguments cannot be bound until the whole JSON has arrived — so use `generate()`
+for typed results.
 
 **Close a stream you stop reading early.** Breaking out of the loop leaves the HTTP response — and its
 pooled connection — open; `chunks.close()` releases it and the observability span. Draining to the end
@@ -244,7 +247,7 @@ See [IAM for Bedrock powered by AWS Mantle](https://docs.aws.amazon.com/service-
 
 **`bedrock:InvokeModelWithResponseStream` is a separate action** — `ConverseStream` included, despite
 being authorized separately from `Converse`. So a role that calls `chat()` fine can be denied on
-`chatStream()` alone. Mantle is the exception: `bedrock-mantle:CreateInference` authorizes streaming and
+`chatAsStream()` alone. Mantle is the exception: `bedrock-mantle:CreateInference` authorizes streaming and
 non-streaming alike.
 
 ### Cohere `inputType` decides your retrieval quality

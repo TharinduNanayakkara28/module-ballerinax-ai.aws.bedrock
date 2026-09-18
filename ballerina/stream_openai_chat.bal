@@ -14,7 +14,7 @@
 
 import ballerina/ai;
 
-// OpenAI `chat.completion.chunk` -> `ai:ChatCompletionChunk`.
+// OpenAI `chat.completion.chunk` -> `ai:ChatMessageChunk`.
 //
 // Serves FOUR converters across BOTH wires, because the chunk object is the same
 // wherever this dialect is spoken:
@@ -40,7 +40,11 @@ import ballerina/ai;
 class OpenAIChatStreamDecoder {
     *StreamChunkDecoder;
 
-    isolated function decode(string eventType, json payload) returns ai:ChatCompletionChunk|ai:Error? {
+    // Tool-call indices whose first fragment has already gone out. Some vendors
+    // repeat `id`/`name` on later fragments; the contract sends them once.
+    private final map<boolean> announced = {};
+
+    isolated function decode(string eventType, json payload) returns StreamUpdate|ai:Error? {
         map<json> p = payload is map<json> ? payload : {};
 
         // An in-band failure. The OpenAI dialects can put an `error` object on an
@@ -53,9 +57,7 @@ class OpenAIChatStreamDecoder {
             return error ai:LlmError(string `Bedrock stream error (${kind}): ${detail}`);
         }
 
-        ai:ChatCompletionChunkDelta delta = {};
-        ai:FinishReason? finishReason = ();
-
+        ai:ChatMessageChunk chunk = {role: ai:ASSISTANT};
         json[]? choices = arrField(p, "choices");
         if choices is json[] && choices.length() > 0 {
             json first = choices[0];
@@ -66,157 +68,100 @@ class OpenAIChatStreamDecoder {
                 // and reading only `delta` there would drop every token.
                 map<json>? d = mapField(first, "delta") ?: mapField(first, "message");
                 if d is map<json> {
-                    delta = self.mapDelta(d);
+                    self.mapDelta(d, chunk);
                 }
-                // `stop_reason` is Mistral's spelling of the same field (§7.2).
-                finishReason = mapOpenAIFinishReason(
+                // `stop_reason` is Mistral's spelling of the same field.
+                chunk.finishReason = mapOpenAIFinishReason(
                         strField(first, "finish_reason") ?: strField(first, "stop_reason"));
             }
         }
 
-        // Usage rides the FINAL chunk, which carries an EMPTY `choices` array — so
-        // what decides whether an event is worth emitting is the CONTENT it produced,
-        // never the choice count. On Mantle usage appears only when the request asked
-        // for it (`stream_options: {include_usage: true}`, set by the converter); on
-        // Invoke it arrives as Bedrock's own invocation metrics, which is the only
-        // usage those vendors report at all.
-        ai:CompletionTokenUsage? usage = openAIChatUsage(p) ?: invocationMetricsUsage(p);
-        if usage is () && finishReason is () && isEmptyDelta(delta) {
-            // A keep-alive, a lifecycle-only object, or a choice whose delta carried
-            // nothing. Skipping keeps an empty chunk — one a caller would have to
-            // filter out of its own output — off the stream, the same way
-            // `contentBlockStop` is skipped on Converse.
-            return ();
+        StreamUpdate update = {};
+        // A role-only opener, a keep-alive or an empty delta carries nothing for the
+        // caller, so no chunk is emitted for it.
+        if chunk.content is string || chunk.reasoning is string || chunk.toolCalls is ai:ToolCallChunk[]
+                || chunk.finishReason is ai:FinishReason {
+            update.chunk = chunk;
         }
-        ai:ChatCompletionChunk chunk = singleChoiceChunk(delta, finishReason);
-        if usage is ai:CompletionTokenUsage {
-            chunk.usage = usage;
+        // Usage rides the FINAL chunk, which carries an EMPTY `choices` array. On
+        // Mantle it appears only when the request asked for it
+        // (`stream_options: {include_usage: true}`, set by the converter); on Invoke
+        // it arrives as Bedrock's own invocation metrics.
+        StreamUsage? usage = openAIChatUsage(p) ?: invocationMetricsUsage(p);
+        if usage is StreamUsage {
+            update.usage = usage;
         }
-        // This dialect names itself, unlike Converse — keep what it sent rather than
-        // letting the iterator backfill the request id and the configured model id.
         string? id = strField(p, "id");
         if id is string {
-            chunk.id = id;
+            update.responseId = id;
         }
-        string? model = strField(p, "model");
-        if model is string {
-            chunk.model = model;
-        }
-        return chunk;
+        return update.length() == 0 ? () : update;
     }
 
-    // One `delta` (or buffered `message`) object -> the normalized delta.
-    private isolated function mapDelta(map<json> d) returns ai:ChatCompletionChunkDelta {
-        ai:ChatCompletionChunkDelta delta = {};
-        ai:ROLE? role = mapOpenAIRole(strField(d, "role"));
-        if role is ai:ROLE {
-            delta.role = role;
-        }
+    // One `delta` (or buffered `message`) object -> the chunk's content members.
+    private isolated function mapDelta(map<json> d, ai:ChatMessageChunk chunk) {
         string? content = strField(d, "content");
-        if content is string {
-            delta.content = content;
+        if content is string && content != "" {
+            chunk.content = content;
         }
         // Reasoning models on this dialect (DeepSeek V3.x, Qwen with thinking on)
         // stream their chain-of-thought in a SEPARATE member, so it reaches the
         // caller as `reasoning` and never merges into the answer text. `reasoning`
         // is the newer spelling of the same field.
         string? reasoning = strField(d, "reasoning_content") ?: strField(d, "reasoning");
-        if reasoning is string {
-            delta.reasoning = reasoning;
+        if reasoning is string && reasoning != "" {
+            chunk.reasoning = reasoning;
         }
 
         json[]? toolCalls = arrField(d, "tool_calls");
         if toolCalls is json[] && toolCalls.length() > 0 {
-            ai:ToolCallChunk[] chunks = [];
+            ai:ToolCallChunk[] calls = [];
             int position = 0;
             foreach json call in toolCalls {
                 if call is map<json> {
-                    chunks.push(self.mapToolCall(call, position));
+                    ai:ToolCallChunk? mapped = self.mapToolCall(call, position);
+                    if mapped is ai:ToolCallChunk {
+                        calls.push(mapped);
+                    }
                 }
                 position += 1;
             }
-            if chunks.length() > 0 {
-                delta.toolCalls = chunks;
+            if calls.length() > 0 {
+                chunk.toolCalls = calls;
             }
         }
-        return delta;
     }
 
-    // One streamed tool-call fragment.
+    // One streamed tool-call fragment, or `()` if it carries nothing.
     //
     // NO `ToolIndexMap` here, unlike every other dialect: `tool_calls[].index`
     // already numbers the TOOL CALLS from 0 — it is the field `ai:ToolCallChunk.index`
-    // was modelled on — so remapping it would be a no-op at best and a renumbering
-    // at worst. The array position is the fallback for a vendor that omits it, which
-    // is correct for the single-chunk tool calls those vendors emit.
-    private isolated function mapToolCall(map<json> call, int position) returns ai:ToolCallChunk {
-        ai:ToolCallChunk chunk = {index: intField(call, "index") ?: position};
-        string? id = strField(call, "id");
-        if id is string {
-            chunk.id = id;
+    // was modelled on. The array position is the fallback for a vendor that omits
+    // it, which is correct for the single-chunk tool calls those vendors emit.
+    private isolated function mapToolCall(map<json> call, int position) returns ai:ToolCallChunk? {
+        int index = intField(call, "index") ?: position;
+        map<json> fn = mapField(call, "function") ?: {};
+        string key = index.toString();
+        boolean first = !self.announced.hasKey(key);
+        string? id = first ? strField(call, "id") : ();
+        string? name = first ? strField(fn, "name") : ();
+        if id is string || name is string {
+            self.announced[key] = true;
         }
-        map<json>? fn = mapField(call, "function");
-        if fn is map<json> {
-            ai:FunctionCallChunk fragment = {};
-            string? name = strField(fn, "name");
-            if name is string {
-                fragment.name = name;
-            }
-            // Partial JSON, forwarded verbatim on every fragment — exactly what
-            // `FunctionCallChunk.arguments` is defined to carry.
-            string? arguments = strField(fn, "arguments");
-            if arguments is string {
-                fragment.arguments = arguments;
-            }
-            chunk.'function = fragment;
-        }
-        return chunk;
+        ai:ToolCallChunk mapped = toolCallChunk(index, id, name, strField(fn, "arguments"));
+        return mapped.length() == 1 ? () : mapped;
     }
 }
 
 // The OpenAI `usage` object. Absent on all but the final chunk, and absent
-// entirely unless `stream_options: {include_usage: true}` was sent.
-isolated function openAIChatUsage(map<json> payload) returns ai:CompletionTokenUsage? {
+// entirely unless `stream_options: {include_usage: true}` was sent. `"usage": null`
+// on every non-final chunk is the documented shape.
+isolated function openAIChatUsage(map<json> payload) returns StreamUsage? {
     map<json>? usage = mapField(payload, "usage");
     if usage is () {
         return ();
     }
-    int? promptTokens = intField(usage, "prompt_tokens");
-    int? completionTokens = intField(usage, "completion_tokens");
-    int? totalTokens = intField(usage, "total_tokens");
-    if promptTokens is () && completionTokens is () && totalTokens is () {
-        // `"usage": null` on every non-final chunk is the documented shape; treat an
-        // empty object the same way rather than emitting a usage chunk of zeroes.
-        return ();
-    }
-    ai:CompletionTokenUsage mapped = {};
-    if promptTokens is int {
-        mapped.promptTokens = promptTokens;
-    }
-    if completionTokens is int {
-        mapped.completionTokens = completionTokens;
-    }
-    if totalTokens is int {
-        mapped.totalTokens = totalTokens;
-    }
-    return mapped;
-}
-
-// OpenAI `role` -> `ai:ROLE`. A lookup, never a `<ai:ROLE>` cast, which would panic
-// mid-stream on a value the enum does not carry.
-isolated function mapOpenAIRole(string? role) returns ai:ROLE? {
-    match role {
-        "assistant" => {
-            return ai:ASSISTANT;
-        }
-        "user" => {
-            return ai:USER;
-        }
-        "system" => {
-            return ai:SYSTEM;
-        }
-    }
-    return ();
+    return streamUsage(intField(usage, "prompt_tokens"), intField(usage, "completion_tokens"));
 }
 
 // OpenAI `finish_reason` (and Mistral's `stop_reason`) -> `ai:FinishReason`.
@@ -242,9 +187,3 @@ isolated function mapOpenAIFinishReason(string? finishReason) returns ai:FinishR
     }
     return ();
 }
-
-// Whether a delta carries nothing at all. `ai:ChatCompletionChunkDelta` defaults
-// `content`, `reasoning` and `toolCalls` to `()`, so an all-defaults record is the
-// "no news" chunk some vendors emit between real ones.
-isolated function isEmptyDelta(ai:ChatCompletionChunkDelta delta) returns boolean =>
-    delta.content is () && delta.reasoning is () && delta.toolCalls is () && delta?.role is ();

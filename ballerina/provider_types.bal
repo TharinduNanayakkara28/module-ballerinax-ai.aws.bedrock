@@ -202,20 +202,20 @@ type ModelConverter record {|
     # Lives on the converter because tool-choice tracks the wire shape, not the route family.
     ToolChoiceStyle toolChoice;
     # The native stream dialect this converter's route speaks, or `()` where the route
-    # has no streaming decoder. Read by `runChatStream`, which refuses `chatStream`
+    # has no streaming decoder. Read by `openChunkStream`, which refuses `chatAsStream`
     # before any I/O when it is `()`.
     #
     # ONE field, replacing the write-only `supportsStreaming` boolean this record
     # carried before. A flag and an id-based dialect lookup are derived independently
     # and can disagree: the lookup answered `()` for an opaque ARN — whose
     # `bareModelId` IS the ARN string, matching no vendor prefix — while the flag
-    # still said `true`, so `chatStream` failed on every ARN route that `chat` served
+    # still said `true`, so `chatAsStream` failed on every ARN route that `chat` served
     # fine. Hanging the dialect off the converter makes that unrepresentable:
     # `selectConverter` already resolves an ARN's dialect from `modelSchema`, and
     # whatever it picks carries its own answer.
     StreamDialect? streamDialect;
     # Body fields that turn this route's request into a STREAMING request, merged
-    # into the encoded body by `runChatStream`. `()` on `bedrock-runtime`, where
+    # into the encoded body by `openChunkStream`. `()` on `bedrock-runtime`, where
     # streaming is a separate OPERATION and the body is byte-identical to the
     # buffered call; `{"stream": true}` (and whatever else the dialect hides usage
     # behind) on Mantle, which streams from the SAME path.
